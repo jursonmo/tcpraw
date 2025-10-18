@@ -154,63 +154,87 @@ func (conn *tcpConn) cleaner() {
 	}
 }
 
-// captureFlow capture every inbound packets based on rules of BPF
 func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
+	// 创建一个长度为2048字节的缓冲区，用于接收网络数据
 	buf := make([]byte, 2048)
+	// 设置gopacket解码选项：NoCopy=true表示不复制payload，Lazy=true表示延迟解码
 	opt := gopacket.DecodeOptions{NoCopy: true, Lazy: true}
 	for {
+		// 从IP层读取数据到buf，返回读取到的字节数n，发送方地址addr，以及错误信息err
 		n, addr, err := handle.ReadFromIP(buf)
 		if err != nil {
+			// 发生错误时退出循环，结束函数
 			return
 		}
 
-		// try decoding TCP frame from buf[:n]
+		// 尝试把收到的buf[:n]数据解析为TCP包
 		packet := gopacket.NewPacket(buf[:n], layers.LayerTypeTCP, opt)
+		// 获取TransportLayer层（传输层）
 		transport := packet.TransportLayer()
+		// 尝试将transport（接口）断言为TCP层对象
 		tcp, ok := transport.(*layers.TCP)
 		if !ok {
+			// 如果不是TCP包，跳过本次循环
 			continue
 		}
 
-		// port filtering
+		// 端口过滤，只处理目标端口等于port的TCP包
 		if int(tcp.DstPort) != port {
 			continue
 		}
 
-		// address building
+		// 组装源地址，将收到包的源IP和源端口号构建为TCPAddr结构
 		var src net.TCPAddr
 		src.IP = addr.IP
 		src.Port = int(tcp.SrcPort)
 
-		var orphan bool
-		// flow maintaince
+		var orphan bool // 标记该流是否“孤立”
+		// 流表维护
 		conn.lockflow(&src, func(e *tcpFlow) {
-			if e.conn == nil { // make sure it's related to net.TCPConn
-				orphan = true // mark as orphan if it's not related net.TCPConn
+			// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
+			if e.conn == nil {
+				orphan = true
 			}
 
-			// to keep track of TCP header related to this source
+			// 记录当前流的最近活动时间为当前时间
 			e.ts = time.Now()
+			// 如果收到ACK包，则记录序号
 			if tcp.ACK {
 				e.seq = tcp.Ack
 			}
+			// 如果收到SYN包，则记录下一个期待的ack值
 			if tcp.SYN {
 				e.ack = tcp.Seq + 1
 			}
+			// 如果收到PSH包，且ack与当前序号相等，则更新ack为收到的数据长度之后
 			if tcp.PSH {
-				if e.ack == tcp.Seq {
+				//mo: 如果ack与当前序号相等，才更新ack, 如果对方发送还没来得及收到本端的ack, 还是会继续发送原来seq但是新内容的数据
+				// 这对于真实是tcp socket 来说, 是重传? 但是对于tcpraw来说, 是正常行为,只需要正常处理接受的新数据就行。
+				// 但是这有个问题，真实的tcp接受到数据后，是会自动回应ack, 收到超前的seq,也会认为有报文丢失，也会发送旧ack,
+				// 这样跟tcpraw的ack不一致的话，没有问题吗? 一直不一致的话，真实socket 会不会断开连接?
+				//还是说，由于数据都是只从tcpraw发送出去的，tcpraw只有e.ack == tcp.seq 才更新ack, 如果对方发送还没来得及收到本端的ack,
+				// 还是会继续发送原来seq但是新内容的数据, 这样真实socket 只会认为重传,不会断开，而且它回应的ack 没有push标志位，不会导致tcpraw 更新ack,
+				// 但是真实tcp socket 的回应的ack 还有可能超过tcpraw 发出ack吗？不可能, 比如对方tcpraw发送了seq=50的200个字节, 然后又发送seq=5的100个字节,
+				// 本端真实tcp socket 已经更新ack=250,会认为seq=5的100个字节是重传, 但是tcpraw也更新本地ack=50+200=250, 再次收到seq=5的100个字节,不会更新ack
+				// 但是依然把seq=5的100个字节数据发供上层应用读取，在本端没有把ack=250发送给对方前，对方依然用seq=50来说发送数据，可能发送seq=50 80字节数据， 没有影响。
+				// 但是有一种情况可能会导致真实tcp socket 断开连接: tcpraw 更新了ack, 但是本地真实socket 没有更新ack, 即tcpraw ack 超过了真实socket ack, 后续的报文，真实socket 会认为数据丢失，这样会导致真实socket 断开连接。
+				// 同时真正的tcp socket 被设置ttl, 以便iptables DROP 丢弃，也就是无法发送到对方的。但是关闭真实tcp socket时，设置ttl 不为1, 这样可以关闭真实socket？ 但是本端发送fin时， 对方收到后，回应的ack ttl 也是1吗， 那对方还是发不出去啊， TODO:测试下tcp 关闭是否异常?。
+				if e.ack == tcp.Seq { //mo: 由于真实socket是不发送数据的，那么更新ack肯定是对方tcpraw 发送的.也就是导致ack更新的因素是单一的，这样保证ack的更新是正确的。
 					e.ack = tcp.Seq + uint32(len(tcp.Payload))
 				}
 			}
+			// 记录当前的网络句柄
 			e.handle = handle
 		})
 
-		// push data if it's not orphan
+		// 如果此流不是孤立的，并收到PSH（说明有数据负载），则把数据推送出去
 		if !orphan && tcp.PSH {
+			// 拷贝TCP负载内容到新的切片
 			payload := make([]byte, len(tcp.Payload))
 			copy(payload, tcp.Payload)
+			// 通过通道chMessage把数据发送出来，或监听到conn.die关闭返回
 			select {
-			case conn.chMessage <- message{payload, &src}:
+			case conn.chMessage <- message{payload, &src}: //mo: 不是孤立才将数据发送出来，供上层应用读取, 也就上层读取到的数据是一定不是孤立的()
 			case <-conn.die:
 				return
 			}
@@ -268,7 +292,7 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 		conn.lockflow(addr, func(e *tcpFlow) {
 			// if the flow doesn't have handle , assume this packet has lost, without notification
-			if e.handle == nil {
+			if e.handle == nil { //mo: 经过captureFlow 捕获过的flow 都有handle, 没有handle的flow说明是本端主动发送一个全新的包， 理论上不应该发送， 应该返回错误。
 				n = len(p)
 				return
 			}
@@ -305,7 +329,7 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			e.buf.Clear()
 			gopacket.SerializeLayers(e.buf, conn.opts, &e.tcpHeader, gopacket.Payload(p))
 			if conn.tcpconn != nil {
-				_, err = e.handle.Write(e.buf.Bytes())
+				_, err = e.handle.Write(e.buf.Bytes()) //mo: 说明是client端，发送数据到对方, client dialIp 是指定了目的ip, 所以发送数据是直接发送给对方。
 			} else {
 				_, err = e.handle.WriteToIP(e.buf.Bytes(), &net.IPAddr{IP: raddr.IP})
 			}
@@ -428,41 +452,51 @@ func (conn *tcpConn) SetWriteBuffer(bytes int) error {
 	return err
 }
 
-// Dial connects to the remote TCP port,
-// and returns a single packet-oriented connection
+// Dial 负责建立到远端 TCP 端口的“包级别”连接，并返回一个 TCPConn 对象。
+// 函数中必须建立一个真实的 TCP 连接，它不仅仅是“占位”，还起到了核心作用：
+// 1. 用真实的 net.DialTCP 建立连接后，本地系统协议栈会分配端口，并建立完整的连接状态。
+//    这保证了后续构造“伪造 TCP 包”时能够获得合法的本地 IP/端口信息（如五元组），
+//    并能通过 conn.tcpconn 对象查到 local addr 用于转发和标识本机的 TCP socket。
+// 2. 建立真实连接还能方便利用内核路由决策、接收回包（例如被动接收 SYN/ACK 等），
+//    同时通过修改 TTL 和支持 iptables DROP，可以实现仅流量探测但实际不收包的用例。
+// 3. 还为了维持内核的 socket 状态，防止端口在 NAT 或路由设备上被清理/超时失效，
+//    所以 io.Copy(ioutil.Discard, tcpconn) 保持连接“活跃”，即便实际数据被丢弃。
+// 真实建立连接还能让应用对等端看到一个真的连接存在，有时对探测、旁路等需求至关重要。
+// "占位"只是它的部分作用，实际上是确保模拟 TCP 包传输的上下文环境和连接之所有必要状态。
+
 func Dial(network, address string) (*TCPConn, error) {
-	// remote address resolve
+	// 解析远端地址
 	raddr, err := net.ResolveTCPAddr(network, address)
 	if err != nil {
 		return nil, err
 	}
 
-	// AF_INET
-	handle, err := net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP})
+	// 使用原始 IP 层建立包捕获/发送句柄, 抓到的数据是tcp 协议的包是tcp层的数据, 包括tcp头和tcp负载， 不带ip层数据， 发送数据也是只发送tcp层的数据, 不包括ip层头部。
+	handle, err := net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP}) //mo:抓取的是所有tcp包，多个client都这么做，是不是性能会下降? 指定了目的ip, 应该只抓取目的ip的tcp包.
 	if err != nil {
 		return nil, err
 	}
 
-	// create an established tcp connection
-	// will hack this tcp connection for packet transmission
+	// 关键：建立一个真实的 TCP socket 完全建立连接
+	// 这能保证 NAT、协议栈等分配资源，且本地端口、路由、五元组都正确
 	tcpconn, err := net.DialTCP(network, nil, raddr)
 	if err != nil {
 		return nil, err
 	}
 
-	// parse local ip and port from tcpconn
+	// 解析本地分配的 ip 和端口
 	laddr, lport, err := net.SplitHostPort(tcpconn.LocalAddr().String())
 	if err != nil {
 		return nil, err
 	}
 
-	// fields
+	// 初始化 tcpConn 对象及核心字段
 	conn := new(tcpConn)
 	conn.die = make(chan struct{})
 	conn.flowTable = make(map[string]*tcpFlow)
 	conn.tcpconn = tcpconn
 	conn.chMessage = make(chan message)
-	conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow) { e.conn = tcpconn })
+	conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow) { e.conn = tcpconn }) //mo: 创建flow表项，并关联底层net.TCPConn
 	conn.handles = append(conn.handles, handle)
 	conn.opts = gopacket.SerializeOptions{
 		FixLengths:       true,
@@ -473,13 +507,13 @@ func Dial(network, address string) (*TCPConn, error) {
 	go conn.captureFlow(handle, tcpconn.LocalAddr().(*net.TCPAddr).Port)
 	go conn.cleaner()
 
-	// iptables
+	// 初始化 iptables 规则，保证 TTL=1 的包来自该 socket 会被立即丢弃。
 	err = setTTL(tcpconn, 1)
 	if err != nil {
 		return nil, err
 	}
 
-	// setup iptables only when it's the first connection
+	// 设置 IPv4 iptables 规则
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
 		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
 		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
@@ -491,6 +525,7 @@ func Dial(network, address string) (*TCPConn, error) {
 			}
 		}
 	}
+	// 设置 IPv6 iptables 规则
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
 		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
 		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
@@ -503,10 +538,9 @@ func Dial(network, address string) (*TCPConn, error) {
 		}
 	}
 
-	// discard everything
 	go io.Copy(ioutil.Discard, tcpconn)
 
-	// push back to the global list and set the elem
+	// 维护全局链表（便于统一管理和 GC）
 	connListMu.Lock()
 	conn.elem = connList.PushBack(conn)
 	connListMu.Unlock()
@@ -634,7 +668,12 @@ func Listen(network, address string) (*TCPConn, error) {
 	return wrapConn(conn), nil
 }
 
-// setTTL sets the Time-To-Live field on a given connection
+// setTTL 在本项目中用于设置底层 socket 的 TTL（Time-To-Live）字段。
+// 这样做的目的是：
+//  1. 在客户端建立真实 TCP 连接时，将 TTL 设置为 1，配合 iptables 只丢弃（DROP）本地发出的 TTL=1 的 TCP 包，
+//     能确保发往远端的伪造包通过原始接口“真正发送”，但由本地协议栈发出的正常 TCP 包被立即丢弃，避免干扰或被远端接收。
+//  2. 实现旁路探测/透明代理等能力时，可以使得正常流量不离开本机，仅通过自定义的原始包发送实现
+//     TCP 协议行为的仿真，从而增强流量可控性和隔离性。
 func setTTL(c *net.TCPConn, ttl int) error {
 	raw, err := c.SyscallConn()
 	if err != nil {
