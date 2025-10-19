@@ -178,7 +178,11 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 			continue
 		}
 
-		// 端口过滤，只处理目标端口等于port的TCP包
+		// 端口过滤，只处理目标端口等于port的TCP包.
+		// mo: TODO:对于client 而已，应该再过滤下数据报文的目的ip是否是本机ip，如果不是本机ip，则丢弃。
+		//			如果在创建handle 时，指定了源地址，那么就不需要维护多flow了， client handle 在Dial 时，应该自动绑定了源地址？
+		//      确实,对于server 而已，可能侦听了0.0.0.0:port， listen 时，创建多个handle，每个handle指定了一个本地ip作为listen源地址，handle 抓到的报文的目的ip肯定是handle 绑定的侦听ip，所以也只需要过滤port。
+		//
 		if int(tcp.DstPort) != port {
 			continue
 		}
@@ -189,9 +193,12 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 		src.Port = int(tcp.SrcPort)
 
 		var orphan bool // 标记该流是否“孤立”
-		// 流表维护
+		// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
+		// TODO: 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
 		conn.lockflow(&src, func(e *tcpFlow) {
 			// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
+			// 如果是client, 在dial 时，会建立一个真实的tcp连接， 当时就绑定了真实tcp conn，所以e.conn不为nil
+			// 如果是server, 在真实tcp listen accept时，会建立一个真实的tcp连接， 这时才绑定了真实tcp conn，业务都是真实tcp dial成功后才发送数据，这时抓得到的数据的flow 可能不是孤立的了。
 			if e.conn == nil {
 				orphan = true
 			}
@@ -473,6 +480,7 @@ func Dial(network, address string) (*TCPConn, error) {
 
 	// 使用原始 IP 层建立包捕获/发送句柄, 抓到的数据是tcp 协议的包是tcp层的数据, 包括tcp头和tcp负载， 不带ip层数据， 发送数据也是只发送tcp层的数据, 不包括ip层头部。
 	handle, err := net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP}) //mo:抓取的是所有tcp包，多个client都这么做，是不是性能会下降? 指定了目的ip, 应该只抓取目的ip的tcp包.
+	//mo:handle 会自动绑定一个本地地址，可以通过 handle.LocalAddr() 获取。在writeTo 时，需要使用这个本地地址来生成tcp校验头部。
 	if err != nil {
 		return nil, err
 	}
@@ -482,6 +490,11 @@ func Dial(network, address string) (*TCPConn, error) {
 	tcpconn, err := net.DialTCP(network, nil, raddr)
 	if err != nil {
 		return nil, err
+	}
+
+	//mo: 理论上，handle 和 tcpconn 绑定的本地地址应该是一样的。不然发送数据时，无法生成正确的tcp校验头部。
+	if handle.LocalAddr().String() != tcpconn.LocalAddr().String() {
+		panic(fmt.Sprintf("handle and tcpconn bound local address are not the same: handle: %v, tcpconn: %v", handle.LocalAddr(), tcpconn.LocalAddr()))
 	}
 
 	// 解析本地分配的 ip 和端口
