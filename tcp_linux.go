@@ -125,6 +125,13 @@ func (conn *tcpConn) lockflow(addr net.Addr, f func(e *tcpFlow)) {
 		e = new(tcpFlow)                      // Create a new flow if it doesn't exist
 		e.ts = time.Now()                     // Set the timestamp to the current time
 		e.buf = gopacket.NewSerializeBuffer() // Initialize the serialization buffer
+		//add by mo: 打印下是client 或server 创建的flow
+		// if conn.tcpconn != nil {
+		// 	log.Println("conn:", conn.tcpconn.LocalAddr().String(), "new flow:", key)
+		// } else {
+		// 	log.Println("listener:", conn.listener.Addr().String(), "new flow:", key)
+		// }
+		//end by mo
 	}
 	f(e)                    // Apply the function to the flow entry
 	conn.flowTable[key] = e // Store the modified flow entry back into the table
@@ -300,7 +307,7 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		conn.lockflow(addr, func(e *tcpFlow) {
 			// if the flow doesn't have handle , assume this packet has lost, without notification
 			if e.handle == nil { //mo: 经过captureFlow 捕获过的flow 都有handle, 没有handle的flow说明是本端主动发送一个全新的包， 理论上不应该发送， 应该返回错误。
-				n = len(p)
+				//n = len(p) //mo: 这里不返回n = len(p)，而是返回 n=0， 这样上层应用可以根据返回的n=0，来判断是否重新发送数据。
 				return
 			}
 
@@ -404,6 +411,14 @@ func (conn *tcpConn) LocalAddr() net.Addr {
 	return nil
 }
 
+// add by mo: 只有client 才会返回remote addr
+func (conn *tcpConn) RemoteAddr() net.Addr {
+	if conn.tcpconn != nil {
+		return conn.tcpconn.RemoteAddr()
+	}
+	return nil
+}
+
 // SetDeadline implements the Conn SetDeadline method.
 func (conn *tcpConn) SetDeadline(t time.Time) error {
 	if err := conn.SetReadDeadline(t); err != nil {
@@ -489,18 +504,22 @@ func Dial(network, address string) (*TCPConn, error) {
 	// 这能保证 NAT、协议栈等分配资源，且本地端口、路由、五元组都正确
 	tcpconn, err := net.DialTCP(network, nil, raddr)
 	if err != nil {
+		//add by mo: 真实tcp dial 失败，需要关闭handle
+		// 能不能把handle的创建放在真是tcp成功之后呢, 这样tcp dial 失败就不需要关闭handle? 不行
+		// 这样handle就抓不到真实tcp socket的三次握手了, flow的handle 就为空,这时业务层发送数据时,WriteTo函数里flow就找不handle,发送不出去, 等接受到该flow数据并绑定handle后才能发送数据。
+		handle.Close() //fix by mo:真实tcp dial 失败，需要关闭handle
 		return nil, err
-	}
-
-	//mo: 理论上，handle 和 tcpconn 绑定的本地地址应该是一样的。不然发送数据时，无法生成正确的tcp校验头部。
-	if handle.LocalAddr().String() != tcpconn.LocalAddr().String() {
-		panic(fmt.Sprintf("handle and tcpconn bound local address are not the same: handle: %v, tcpconn: %v", handle.LocalAddr(), tcpconn.LocalAddr()))
 	}
 
 	// 解析本地分配的 ip 和端口
 	laddr, lport, err := net.SplitHostPort(tcpconn.LocalAddr().String())
 	if err != nil {
 		return nil, err
+	}
+
+	//mo: check handle 和 tcpconn 绑定的本地地址是否相同
+	if handle.LocalAddr().String() != laddr {
+		panic(fmt.Sprintf("handle and tcpconn bound local address are not the same: handle: %v, tcpconn: %v", handle.LocalAddr(), laddr))
 	}
 
 	// 初始化 tcpConn 对象及核心字段
@@ -526,6 +545,7 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
+	// mo: 那么真实tcp 如何保持连接呢? 真实tcp 连接被设置ttl=1, 会被立即丢弃, 构造的数据能让真实tcp 保持连接吗? 还是说真实的tcp是否是连接状态也无所谓。经过验证，真实tcp断开了也没关系, 依然能用tcpraw 收发数据。
 	// 设置 IPv4 iptables 规则
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
 		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
