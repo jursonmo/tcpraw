@@ -151,6 +151,7 @@ func (l *Listener) String() string {
 }
 
 /*
+服务端设备上:
 listener 启动并接受连接后，netstat -anlp|grep 9191 可以看到两个socket:
 # netstat -anlp|grep 9191
 tcp        0      0 192.168.4.208:9191      0.0.0.0:*               LISTEN      3132762/./server
@@ -161,6 +162,14 @@ root@ubuntu2204:/home/obc# netstat -anlp|grep 9191
 tcp        0      0 192.168.4.208:9191      0.0.0.0:*               LISTEN      3132762/./server
 也就是ACCEPT 生产的socket 被关闭了。但是不影响业务层收发数据。
 
+// listener 侦听后，iptables 规则如下:
+Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)
+
+	pkts bytes target     prot opt in     out     source               destination
+	 245 13688 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            TTL match TTL == 1 tcp spt:9191
+
+//服务端只需要一条规则就可以丢弃所有本地发出的TTL=1 的TCP 包。
+// 客户端要每次dial 成功时，都要针对指定的ip和端口设置规则，其实可以只需要一条规则, 避免每次都要设置规则，如果忘记删除，规则会越来越多。
 ------------------
 客户端设备上: 客户端连接后，ss -i |grep 9191 -A 1 可以看到连接状态， 过会就没了。
 root@gw:/home/ubuntu# ss -i |grep 9191 -A 1
