@@ -47,7 +47,8 @@ import (
 var (
 	errOpNotImplemented = errors.New("operation not implemented") // Error for unimplemented operations
 	errTimeout          = errors.New("timeout")                   // Error for operation timeout
-	expire              = time.Minute                             // Duration to define expiration time for flows
+	expire              = time.Minute
+	ErrFlowNotFound     = errors.New("flow not found") // Duration to define expiration time for flows
 )
 
 var (
@@ -97,7 +98,7 @@ type tcpConn struct {
 
 	// all TCP flows
 	flowTable map[string]*tcpFlow
-	flowsLock sync.Mutex
+	flowsLock sync.RWMutex
 
 	// iptables
 	iptables  *iptables.IPTables // Handle for IPv4 iptables rules
@@ -114,6 +115,16 @@ type tcpConn struct {
 
 	// fingerprints
 	tcpFingerPrint fingerPrint
+}
+
+// add by mo: 发送数据时，获取flow表项，如果flow表项不存在，则返回错误。可以认为底层连接断开了。
+// 多个任务同时发送数据WriteTo时，可以避免锁竞争。
+func (conn *tcpConn) getflow(addr net.Addr, f func(e *tcpFlow)) {
+	key := addr.String()   // Use the string representation of the address as the key
+	conn.flowsLock.RLock() // Lock the flowTable for safe access
+	e := conn.flowTable[key]
+	f(e)                     // Apply the function to the flow entry
+	conn.flowsLock.RUnlock() // Unlock the flowTable
 }
 
 // lockflow locks the flow table and apply function `f` to the entry, and create one if not exist
@@ -222,7 +233,7 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 			}
 			// 如果收到PSH包，且ack与当前序号相等，则更新ack为收到的数据长度之后
 			if tcp.PSH {
-				//mo: 如果ack与当前序号相等，才更新ack, 如果对方发送还没来得及收到本端的ack, 还是会继续发送原来seq但是新内容的数据
+				//mo: 如果ack与当前序号相等，才更新ack, 如果对方发送还没来得及收到本端的ack, 还是会继续发送原来seq但是是新内容的数据
 				// 这对于真实是tcp socket 来说, 是重传? 但是对于tcpraw来说, 是正常行为,只需要正常处理接受的新数据就行。
 				// 但是这有个问题，真实的tcp接受到数据后，是会自动回应ack, 收到超前的seq,也会认为有报文丢失，也会发送旧ack,
 				// 这样跟tcpraw的ack不一致的话，没有问题吗? 一直不一致的话，真实socket 会不会断开连接?
@@ -304,7 +315,12 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			lport = conn.listener.Addr().(*net.TCPAddr).Port
 		}
 
-		conn.lockflow(addr, func(e *tcpFlow) {
+		//conn.lockflow(addr, func(e *tcpFlow) {
+		conn.getflow(addr, func(e *tcpFlow) {
+			if e == nil {
+				err = ErrFlowNotFound
+				return
+			}
 			// if the flow doesn't have handle , assume this packet has lost, without notification
 			if e.handle == nil { //mo: 经过captureFlow 捕获过的flow 都有handle, 没有handle的flow说明是本端主动发送一个全新的包， 理论上不应该发送， 应该返回错误。
 				//n = len(p) //mo: 这里不返回n = len(p)，而是返回 n=0， 这样上层应用可以根据返回的n=0，来判断是否重新发送数据。
@@ -414,7 +430,7 @@ func (conn *tcpConn) LocalAddr() net.Addr {
 // add by mo: 只有client 才会返回remote addr
 func (conn *tcpConn) RemoteAddr() net.Addr {
 	if conn.tcpconn != nil {
-		return conn.tcpconn.RemoteAddr()
+		return conn.tcpconn.RemoteAddr() //即使tcpconn 被关闭，remote addr 还是有效的。
 	}
 	return nil
 }
@@ -545,10 +561,22 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
-	// mo: 那么真实tcp 如何保持连接呢? 真实tcp 连接被设置ttl=1, 会被立即丢弃, 构造的数据能让真实tcp 保持连接吗? 还是说真实的tcp是否是连接状态也无所谓。经过验证，真实tcp断开了也没关系, 依然能用tcpraw 收发数据。
+	// mo: 那么真实tcp 如何保持连接呢? 真实tcp 连接被设置ttl=1, 会被立即丢弃, 构造的数据能让真实tcp 保持连接吗? 还是说真实的tcp是否是连接状态也无所谓。经过验证，真实tcp断开了也没关系, 依然能正常用tcpraw 收发数据。
 	// 设置 IPv4 iptables 规则
+	// if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
+	// 	rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+	// 	if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
+	// 		if !exists {
+	// 			if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
+	// 				conn.iprule = rule
+	// 				conn.iptables = ipt
+	// 			}
+	// 		}
+	// 	}
+	// }
+	// 设置 IPv4 iptables 规则, 丢弃所有本地发出的TTL=1 的TCP 包。这样不管客户端dial多少次，都只有一条规则。
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
-		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-j", "DROP"}
 		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
 			if !exists {
 				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
