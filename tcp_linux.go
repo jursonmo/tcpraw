@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"runtime"
 	"sync"
@@ -97,8 +98,9 @@ type tcpConn struct {
 	chMessage chan message
 
 	// all TCP flows
-	flowTable map[string]*tcpFlow
-	flowsLock sync.RWMutex
+	sharding   int
+	flowTables []map[string]*tcpFlow
+	flowsLocks []sync.RWMutex
 
 	// iptables
 	iptables  *iptables.IPTables // Handle for IPv4 iptables rules
@@ -117,58 +119,105 @@ type tcpConn struct {
 	tcpFingerPrint fingerPrint
 }
 
+func (conn *tcpConn) initFlowTable(sharding int) {
+	conn.sharding = sharding
+	conn.flowsLocks = make([]sync.RWMutex, sharding)
+	conn.flowTables = make([]map[string]*tcpFlow, sharding)
+	for i := 0; i < sharding; i++ {
+		conn.flowTables[i] = make(map[string]*tcpFlow)
+	}
+}
+
+func addrToNumber(addr net.Addr) uint64 {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		panic("addr is not a tcp address")
+	}
+	ip4 := tcpAddr.IP.To4()
+	if ip4 == nil {
+		//it is ipv6, just support ipv4 for now
+		return 0
+	}
+	ip := binary.BigEndian.Uint32(ip4)
+	return uint64(ip) + uint64(tcpAddr.Port) //TODO:优化算法，让低三位更加分散。因为我们要& (conn.sharding - 1)
+}
+
 // add by mo: 发送数据时，获取flow表项，如果flow表项不存在，则返回错误。可以认为底层连接断开了。
 // 多个任务同时发送数据WriteTo时，可以避免锁竞争。
-func (conn *tcpConn) getflow(addr net.Addr, f func(e *tcpFlow)) {
-	key := addr.String()   // Use the string representation of the address as the key
-	conn.flowsLock.RLock() // Lock the flowTable for safe access
-	e := conn.flowTable[key]
-	f(e)                     // Apply the function to the flow entry
-	conn.flowsLock.RUnlock() // Unlock the flowTable
+func (conn *tcpConn) getflow(addr net.Addr, f func(e *tcpFlow, shardIndex int)) {
+	addrNum := addrToNumber(addr)
+	shardIndex := int(addrNum) & (conn.sharding - 1)
+	key := addr.String()                // Use the string representation of the address as the key
+	conn.flowsLocks[shardIndex].RLock() // Lock the flowTable for safe access
+	e, ok := conn.flowTables[shardIndex][key]
+	if !ok {
+		fmt.Printf("getflow not found: %v, shardIndex: %d\n", addr.String(), shardIndex)
+	}
+	f(e, shardIndex)
+	// Apply the function to the flow entry
+	conn.flowsLocks[shardIndex].RUnlock() // Unlock the flowTable
 }
 
 // lockflow locks the flow table and apply function `f` to the entry, and create one if not exist
 func (conn *tcpConn) lockflow(addr net.Addr, f func(e *tcpFlow)) {
-	key := addr.String()  // Use the string representation of the address as the key
-	conn.flowsLock.Lock() // Lock the flowTable for safe access
-	e := conn.flowTable[key]
+	addrNum := addrToNumber(addr)
+	shardIndex := int(addrNum) & (conn.sharding - 1)
+	key := addr.String()               // Use the string representation of the address as the key
+	conn.flowsLocks[shardIndex].Lock() // Lock the flowTable for safe access
+	e := conn.flowTables[shardIndex][key]
 	if e == nil { // entry first visit
 		e = new(tcpFlow)                      // Create a new flow if it doesn't exist
 		e.ts = time.Now()                     // Set the timestamp to the current time
 		e.buf = gopacket.NewSerializeBuffer() // Initialize the serialization buffer
 		//add by mo: 打印下是client 或server 创建的flow
-		// if conn.tcpconn != nil {
-		// 	log.Println("conn:", conn.tcpconn.LocalAddr().String(), "new flow:", key)
-		// } else {
-		// 	log.Println("listener:", conn.listener.Addr().String(), "new flow:", key)
-		// }
+		if conn.tcpconn != nil {
+			log.Println("conn:", conn.tcpconn.LocalAddr().String(), "new flow:", key, "shardIndex:", shardIndex)
+		} else {
+			log.Println("listener:", conn.listener.Addr().String(), "new flow:", key, "shardIndex:", shardIndex)
+		}
 		//end by mo
 	}
-	f(e)                    // Apply the function to the flow entry
-	conn.flowTable[key] = e // Store the modified flow entry back into the table
-	conn.flowsLock.Unlock() // Unlock the flowTable
+	f(e)                                 // Apply the function to the flow entry
+	conn.flowTables[shardIndex][key] = e // Store the modified flow entry back into the table
+	conn.flowsLocks[shardIndex].Unlock() // Unlock the flowTable
 }
 
 // clean expired flows
 func (conn *tcpConn) cleaner() {
-	ticker := time.NewTicker(time.Minute) // Create a ticker to trigger flow cleanup every minute
+	ticker := time.NewTicker(time.Second * 33) // Create a ticker to trigger flow cleanup every minute
 	defer ticker.Stop()
-
-	select {
-	case <-conn.die: // Exit if the connection is closed
-		return
-	case <-ticker.C: // On each tick, clean up expired flows
-		conn.flowsLock.Lock()
-		for k, v := range conn.flowTable {
-			if time.Now().Sub(v.ts) > expire { // Check if the flow has expired
-				if v.conn != nil {
-					setTTL(v.conn, 64) // Set TTL before closing the connection
-					v.conn.Close()
+	for { //fix by mo: 需要for来重复执行, 否则执行一次会退出循环。
+		select {
+		case <-conn.die: // Exit if the connection is closed
+			return
+		case <-ticker.C: // On each tick, clean up expired flows
+			log.Println("check expired flows, now: ", time.Now())
+			for i := 0; i < conn.sharding; i++ {
+				conn.flowsLocks[i].Lock()
+				for k, v := range conn.flowTables[i] {
+					if time.Now().Sub(v.ts) > expire {
+						log.Printf("clean expired shard %d flow: %v, ts: %v\n", i, k, v.ts)
+						if v.conn != nil {
+							setTTL(v.conn, 64)
+							v.conn.Close()
+						}
+						delete(conn.flowTables[i], k)
+					}
 				}
-				delete(conn.flowTable, k) // Remove the flow from the table
+				conn.flowsLocks[i].Unlock()
 			}
+			// conn.flowsLock.Lock()
+			// for k, v := range conn.flowTable {
+			// 	if time.Now().Sub(v.ts) > expire { // Check if the flow has expired
+			// 		if v.conn != nil {
+			// 			setTTL(v.conn, 64) // Set TTL before closing the connection
+			// 			v.conn.Close()
+			// 		}
+			// 		delete(conn.flowTable, k) // Remove the flow from the table
+			// 	}
+			// }
+			// conn.flowsLock.Unlock()
 		}
-		conn.flowsLock.Unlock()
 	}
 }
 
@@ -212,7 +261,7 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 
 		var orphan bool // 标记该流是否“孤立”
 		// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
-		// TODO: 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
+		// TODO: bug, 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
 		conn.lockflow(&src, func(e *tcpFlow) {
 			// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
 			// 如果是client, 在dial 时，会建立一个真实的tcp连接， 当时就绑定了真实tcp conn，所以e.conn不为nil
@@ -303,7 +352,9 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	case <-conn.die:
 		return 0, io.EOF
 	default:
-		raddr, err := net.ResolveTCPAddr("tcp", addr.String())
+		//raddr, err := net.ResolveTCPAddr("tcp", addr.String())
+		var raddr *net.TCPAddr
+		raddr, err = net.ResolveTCPAddr("tcp", addr.String())
 		if err != nil {
 			return 0, err
 		}
@@ -316,7 +367,7 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 
 		//conn.lockflow(addr, func(e *tcpFlow) {
-		conn.getflow(addr, func(e *tcpFlow) {
+		conn.getflow(addr, func(e *tcpFlow, shardIndex int) {
 			if e == nil {
 				err = ErrFlowNotFound
 				return
@@ -385,15 +436,26 @@ func (conn *tcpConn) Close() error {
 			err = conn.tcpconn.Close()
 		} else if conn.listener != nil {
 			err = conn.listener.Close() // server
-			conn.flowsLock.Lock()
-			for k, v := range conn.flowTable {
-				if v.conn != nil {
-					setTTL(v.conn, 64)
-					v.conn.Close()
+			for i := 0; i < conn.sharding; i++ {
+				conn.flowsLocks[i].Lock()
+				for k, v := range conn.flowTables[i] {
+					if v.conn != nil {
+						setTTL(v.conn, 64)
+						v.conn.Close()
+					}
+					delete(conn.flowTables[i], k)
 				}
-				delete(conn.flowTable, k)
+				conn.flowsLocks[i].Unlock()
 			}
-			conn.flowsLock.Unlock()
+			// conn.flowsLock.Lock()
+			// for k, v := range conn.flowTable {
+			// 	if v.conn != nil {
+			// 		setTTL(v.conn, 64)
+			// 		v.conn.Close()
+			// 	}
+			// 	delete(conn.flowTable, k)
+			// }
+			// conn.flowsLock.Unlock()
 		}
 
 		// close handles
@@ -541,7 +603,7 @@ func Dial(network, address string) (*TCPConn, error) {
 	// 初始化 tcpConn 对象及核心字段
 	conn := new(tcpConn)
 	conn.die = make(chan struct{})
-	conn.flowTable = make(map[string]*tcpFlow)
+	conn.initFlowTable(1)
 	conn.tcpconn = tcpconn
 	conn.chMessage = make(chan message)
 	conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow) { e.conn = tcpconn }) //mo: 创建flow表项，并关联底层net.TCPConn
@@ -614,7 +676,7 @@ func Dial(network, address string) (*TCPConn, error) {
 func Listen(network, address string) (*TCPConn, error) {
 	// fields
 	conn := new(tcpConn)
-	conn.flowTable = make(map[string]*tcpFlow)
+	conn.initFlowTable(8)
 	conn.die = make(chan struct{})
 	conn.chMessage = make(chan message)
 	conn.opts = gopacket.SerializeOptions{
