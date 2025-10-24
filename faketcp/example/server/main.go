@@ -51,6 +51,6 @@ func handleClient(conn net.Conn) {
 		if err != nil {
 			panic(err)
 		}
-		log.Println("ok server send:", string(buf[:n]), ",bytes:", n)
+		log.Println("ok server send bytes:", n, "data:", string(buf[:n]))
 	}
 }
