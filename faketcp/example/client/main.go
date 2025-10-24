@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"time"
 
@@ -41,12 +42,21 @@ func main() {
 	}()
 
 	for i := 0; i < *count; i++ {
-		time.Sleep(time.Second)
-		b := []byte(fmt.Sprintf("hello server %d", i))
-		n, err := conn.Write(b)
-		if err != nil {
-			panic(err)
+		if i%2 == 1 {
+			b := []byte(fmt.Sprintf("hello %d", i))
+			sendData(conn, b)
+			continue
 		}
-		log.Println("ok client send:", string(b), "bytes:", n)
+		time.Sleep(time.Second)
+		bb := []byte(fmt.Sprintf("hello server %d", i))
+		sendData(conn, bb)
 	}
+}
+
+func sendData(conn net.Conn, data []byte) {
+	n, err := conn.Write(data)
+	if err != nil {
+		panic(err)
+	}
+	log.Println("ok client send:", string(data), "bytes:", n)
 }
