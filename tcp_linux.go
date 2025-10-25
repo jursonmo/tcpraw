@@ -253,6 +253,7 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 		//      确实,对于server 而已，可能侦听了0.0.0.0:port， listen 时，创建多个handle，每个handle指定了一个本地ip作为listen源地址，handle 抓到的报文的目的ip肯定是handle 绑定的侦听ip，所以也只需要过滤port。
 		//
 		if int(tcp.DstPort) != port { //TODO: 可以在创建handle 时，传入相关参数过滤掉非该端口的tcp报文吗，这样在内核层过滤可以提高性功能
+			log.Printf("captureFlow: not target port:%d packet, local: %v:%d, remote: %v, len: %d\n", port, handle.LocalAddr().String(), int(tcp.DstPort), addr.String(), n)
 			continue
 		}
 
@@ -621,6 +622,11 @@ func Dial(network, address string) (*TCPConn, error) {
 	}
 	conn.tcpFingerPrint = fingerPrintLinux
 
+	// add by mo: 在handle 创建时，设置BPF过滤器，只抓取指定端口的tcp报文，提高抓包效率。
+	err = SetBPFFilterPort(handle, uint32(tcpconn.LocalAddr().(*net.TCPAddr).Port))
+	if err != nil {
+		return nil, err
+	}
 	go conn.captureFlow(handle, tcpconn.LocalAddr().(*net.TCPAddr).Port)
 	go conn.cleaner()
 
@@ -725,6 +731,10 @@ func Listen(network, address string) (*TCPConn, error) {
 		}
 	} else {
 		if handle, err := net.ListenIP("ip:tcp", &net.IPAddr{IP: laddr.IP}); err == nil {
+			err = SetBPFFilterPort(handle, uint32(laddr.Port))
+			if err != nil {
+				return nil, err
+			}
 			conn.handles = append(conn.handles, handle)
 			go conn.captureFlow(handle, laddr.Port)
 		} else {
