@@ -159,7 +159,7 @@ func (conn *tcpConn) getflow(addr net.Addr, f func(e *tcpFlow, shardIndex int)) 
 }
 
 // lockflow locks the flow table and apply function `f` to the entry, and create one if not exist
-func (conn *tcpConn) lockflow(addr net.Addr, f func(e *tcpFlow)) {
+func (conn *tcpConn) lockflow(addr net.Addr, f func(e *tcpFlow, shardIndex int)) {
 	addrNum := addrToNumber(addr)
 	shardIndex := int(addrNum) & (conn.sharding - 1)
 	key := addr.String()               // Use the string representation of the address as the key
@@ -177,7 +177,7 @@ func (conn *tcpConn) lockflow(addr net.Addr, f func(e *tcpFlow)) {
 		}
 		//end by mo
 	}
-	f(e)                                 // Apply the function to the flow entry
+	f(e, shardIndex)                     // Apply the function to the flow entry
 	conn.flowTables[shardIndex][key] = e // Store the modified flow entry back into the table
 	conn.flowsLocks[shardIndex].Unlock() // Unlock the flowTable
 }
@@ -242,6 +242,8 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 		tcp, ok := transport.(*layers.TCP)
 		if !ok {
 			// 如果不是TCP包，跳过本次循环
+			log.Printf("captureFlow: not TCP packet, local: %v:%d, remote: %v, len: %d\n", handle.LocalAddr().String(), port, addr.String(), n)
+			panic("not TCP packet, never happen")
 			continue
 		}
 
@@ -250,7 +252,7 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 		//			如果在创建handle 时，指定了源地址，那么就不需要维护多flow了， client handle 在Dial 时，应该自动绑定了源地址？
 		//      确实,对于server 而已，可能侦听了0.0.0.0:port， listen 时，创建多个handle，每个handle指定了一个本地ip作为listen源地址，handle 抓到的报文的目的ip肯定是handle 绑定的侦听ip，所以也只需要过滤port。
 		//
-		if int(tcp.DstPort) != port {
+		if int(tcp.DstPort) != port { //TODO: 可以在创建handle 时，传入相关参数过滤掉非该端口的tcp报文吗，这样在内核层过滤可以提高性功能
 			continue
 		}
 
@@ -259,10 +261,12 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 		src.IP = addr.IP
 		src.Port = int(tcp.SrcPort)
 
+		var shardIndex int
 		var orphan bool // 标记该流是否“孤立”
 		// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
 		// TODO: bug, 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
-		conn.lockflow(&src, func(e *tcpFlow) {
+		conn.lockflow(&src, func(e *tcpFlow, sharding int) {
+			shardIndex = sharding
 			// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
 			// 如果是client, 在dial 时，会建立一个真实的tcp连接， 当时就绑定了真实tcp conn，所以e.conn不为nil
 			// 如果是server, 在真实tcp listen accept时，会建立一个真实的tcp连接， 这时才绑定了真实tcp conn，业务都是真实tcp dial成功后才发送数据，这时抓得到的数据的flow 可能不是孤立的了。
@@ -278,7 +282,8 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 			}
 			// 如果收到SYN包，则记录下一个期待的ack值
 			if tcp.SYN {
-				e.ack = tcp.Seq + 1
+				log.Printf("captureFlow: SYN packet local: %v:%d, remote: %v, seq:%d ack:%d \n", handle.LocalAddr().String(), tcp.DstPort, src.String(), tcp.Seq, tcp.Ack)
+				e.ack = tcp.Seq + 1 //mo:可以认为syn是报文一个字节长度的数据，所以ack = seq + 1。后面发送的数据，ack = seq + len(data)。
 			}
 			// 如果收到PSH包，且ack与当前序号相等，则更新ack为收到的数据长度之后
 			if tcp.PSH {
@@ -306,6 +311,8 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 			// 拷贝TCP负载内容到新的切片
 			payload := make([]byte, len(tcp.Payload))
 			copy(payload, tcp.Payload)
+			_ = shardIndex
+			//log.Println("captureFlow, shardIndex:", shardIndex, "push bytes:", len(payload), "data:", string(payload))
 			// 通过通道chMessage把数据发送出来，或监听到conn.die关闭返回
 			select {
 			case conn.chMessage <- message{payload, &src}: //mo: 不是孤立才将数据发送出来，供上层应用读取, 也就上层读取到的数据是一定不是孤立的()
@@ -573,7 +580,7 @@ func Dial(network, address string) (*TCPConn, error) {
 
 	// 使用原始 IP 层建立包捕获/发送句柄, 抓到的数据是tcp 协议的包是tcp层的数据, 包括tcp头和tcp负载， 不带ip层数据， 发送数据也是只发送tcp层的数据, 不包括ip层头部。
 	handle, err := net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP}) //mo:抓取的是所有tcp包，多个client都这么做，是不是性能会下降? 指定了目的ip, 应该只抓取目的ip的tcp包.
-	//mo:handle 会自动绑定一个本地地址，可以通过 handle.LocalAddr() 获取。在writeTo 时，需要使用这个本地地址来生成tcp校验头部。
+	//mo:handle 会自动绑定一个本地ip地址(不包含端口)，可以通过 handle.LocalAddr() 获取。在writeTo 时，需要使用这个本地地址来生成tcp校验头部, 源端口只能通过真实tcp socket 的本地端口。
 	if err != nil {
 		return nil, err
 	}
@@ -606,7 +613,7 @@ func Dial(network, address string) (*TCPConn, error) {
 	conn.initFlowTable(1)
 	conn.tcpconn = tcpconn
 	conn.chMessage = make(chan message)
-	conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow) { e.conn = tcpconn }) //mo: 创建flow表项，并关联底层net.TCPConn
+	conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow, _ int) { e.conn = tcpconn }) //mo: 创建flow表项，并关联底层net.TCPConn
 	conn.handles = append(conn.handles, handle)
 	conn.opts = gopacket.SerializeOptions{
 		FixLengths:       true,
@@ -776,7 +783,7 @@ func Listen(network, address string) (*TCPConn, error) {
 			}
 
 			// record net.Conn
-			conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow) { e.conn = tcpconn })
+			conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow, _ int) { e.conn = tcpconn })
 
 			// discard everything
 			go io.Copy(ioutil.Discard, tcpconn)
