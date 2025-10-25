@@ -289,7 +289,10 @@ func (l *Listener) acceptDataLoop() {
 		l.mu.RLock()
 		if fc, ok := l.connMap[addr.String()]; ok {
 			l.mu.RUnlock()
-			fc.Push(buf[:n])
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			log.Println("listener push bytes:", n, "data:", string(data))
+			fc.Push(data)
 			continue
 		}
 		l.mu.RUnlock()
@@ -314,7 +317,10 @@ func (l *Listener) acceptDataLoop() {
 			l.mu.Lock()
 			l.connMap[addr.String()] = fc
 			l.mu.Unlock()
-			fc.Push(buf[:n])
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			//log.Println("listener push bytes:", n, "data:", string(data))
+			fc.Push(data)
 		default:
 			log.Println("listener connChan is full, drop connection from:", addr.String())
 		}
