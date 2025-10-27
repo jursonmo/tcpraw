@@ -43,6 +43,7 @@ import (
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"golang.org/x/net/ipv4"
 )
 
 var (
@@ -90,6 +91,7 @@ type tcpConn struct {
 	// the main golang sockets
 	tcpconn  *net.TCPConn     // from net.Dial
 	listener *net.TCPListener // from net.Listen
+	pc       *ipv4.PacketConn
 
 	// handles
 	handles []*net.IPConn
@@ -254,6 +256,7 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 		//
 		if int(tcp.DstPort) != port { //TODO: 可以在创建handle 时，传入相关参数过滤掉非该端口的tcp报文吗，这样在内核层过滤可以提高性功能
 			log.Printf("captureFlow: not target port:%d packet, local: %v:%d, remote: %v, len: %d\n", port, handle.LocalAddr().String(), int(tcp.DstPort), addr.String(), n)
+			panic("not target port packet, never happen")
 			continue
 		}
 
@@ -623,7 +626,9 @@ func Dial(network, address string) (*TCPConn, error) {
 	conn.tcpFingerPrint = fingerPrintLinux
 
 	// add by mo: 在handle 创建时，设置BPF过滤器，只抓取指定端口的tcp报文，提高抓包效率。
-	err = SetBPFFilterPort(handle, uint32(tcpconn.LocalAddr().(*net.TCPAddr).Port))
+	conn.pc = ipv4.NewPacketConn(handle)
+	err = SetBPFFilterPortByPacketConn(conn.pc, uint32(tcpconn.LocalAddr().(*net.TCPAddr).Port))
+	// err = SetBPFFilterPort(handle, uint32(tcpconn.LocalAddr().(*net.TCPAddr).Port))
 	if err != nil {
 		return nil, err
 	}
@@ -731,7 +736,9 @@ func Listen(network, address string) (*TCPConn, error) {
 		}
 	} else {
 		if handle, err := net.ListenIP("ip:tcp", &net.IPAddr{IP: laddr.IP}); err == nil {
-			err = SetBPFFilterPort(handle, uint32(laddr.Port))
+			conn.pc = ipv4.NewPacketConn(handle)
+			err = SetBPFFilterPortByPacketConn(conn.pc, uint32(laddr.Port))
+			//err = SetBPFFilterPort(handle, uint32(laddr.Port))
 			if err != nil {
 				return nil, err
 			}

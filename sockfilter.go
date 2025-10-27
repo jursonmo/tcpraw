@@ -7,6 +7,21 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+// https://www.kernel.org/doc/Documentation/networking/filter.rst
+func SetBPFFilterPortByPacketConn(pc *ipv4.PacketConn, port uint32) error {
+	return pc.SetBPF([]bpf.RawInstruction{
+		{Op: 0x30, Jt: 0, Jf: 0, K: 0x00000009}, // 加载 IP 协议类型 (位于 IP 头偏移 9 字节处)
+		{Op: 0x15, Jt: 0, Jf: 6, K: 0x00000006}, //如果不为6，则跳转到指令6(从0开始计数)，即最后一条指令（丢弃包）
+		{Op: 0x28, Jt: 0, Jf: 0, K: 0x00000006},
+		{Op: 0x45, Jt: 4, Jf: 0, K: 0x00001fff}, //检查分片偏移和标志（如果分片偏移不为0或MF标志为1），则跳转到指令10（即分片包则不匹配）
+		{Op: 0xb1, Jt: 0, Jf: 0, K: 0x00000000},
+		{Op: 0x48, Jt: 0, Jf: 0, K: 0x00000002},
+		{Op: 0x15, Jt: 0, Jf: 1, K: port},
+		{Op: 0x6, Jt: 0, Jf: 0, K: 0x00040000},
+		{Op: 0x6, Jt: 0, Jf: 0, K: 0x00000000},
+	})
+}
+
 func SetBPFFilterPort(conn *net.IPConn, port uint32) error {
 	RawConn, err := ipv4.NewRawConn(conn)
 	if err != nil {
