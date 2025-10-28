@@ -8,12 +8,14 @@ import (
 	"os"
 	"time"
 
+	"github.com/xtaci/tcpraw"
 	"github.com/xtaci/tcpraw/faketcp"
 )
 
 var (
-	addr  = flag.String("addr", "", "server address")
-	count = flag.Int("c", 3, "send count")
+	addr      = flag.String("addr", "", "server address")
+	count     = flag.Int("c", 3, "send count")
+	batchSize = flag.Int("b", 0, "batch size")
 )
 
 func main() {
@@ -22,6 +24,10 @@ func main() {
 		fmt.Printf("addr unset, eg ./%s -addr 2.2.2.2:9191 \n", os.Args[0])
 		return
 	}
+	if batchSize != nil && *batchSize > 0 {
+		tcpraw.BatchSize = *batchSize
+	}
+
 	//ctx := context.Background()
 	conn, err := faketcp.Dial("", *addr)
 	if err != nil {
@@ -48,7 +54,7 @@ func main() {
 			continue
 		}
 		time.Sleep(time.Second)
-		bb := []byte(fmt.Sprintf("hello server %d", i))
+		bb := []byte(fmt.Sprintf("xx hello server %d", i))
 		sendData(conn, bb)
 	}
 }

@@ -8,11 +8,13 @@ import (
 	"net"
 	"os"
 
+	"github.com/xtaci/tcpraw"
 	"github.com/xtaci/tcpraw/faketcp"
 )
 
 var (
-	addr = flag.String("l", "", "listen address")
+	addr      = flag.String("l", "", "listen address")
+	batchSize = flag.Int("b", 0, "batch size")
 )
 
 func main() {
@@ -21,6 +23,10 @@ func main() {
 		fmt.Printf("addr unset, eg ./%s -l 0.0.0.0:9191 \n", os.Args[0])
 		return
 	}
+	if batchSize != nil && *batchSize > 0 {
+		tcpraw.BatchSize = *batchSize
+	}
+
 	ctx := context.Background()
 	l := faketcp.NewFakeTcpListener(ctx)
 	if err := l.Listen(*addr); err != nil {

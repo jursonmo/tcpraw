@@ -23,6 +23,7 @@ func SetBPFFilterPortByPacketConn(pc *ipv4.PacketConn, port uint32) error {
 }
 
 func SetBPFFilterPort(conn *net.IPConn, port uint32) error {
+	//NewRawConn() 会设置 IP_HDRINCL 选项，发送数据时需要自己添加ipv4头部；ipv4.PacketConn 默认不设置 IP_HDRINCL 选项.
 	RawConn, err := ipv4.NewRawConn(conn)
 	if err != nil {
 		return err
@@ -55,7 +56,7 @@ func SetBPFFilterPort(conn *net.IPConn, port uint32) error {
 		{Op: 0x6, Jt: 0, Jf: 0, K: 0x00040000},
 		{Op: 0x6, Jt: 0, Jf: 0, K: 0x00000000},
 	})
-
+	//RawConn.ReadBatch()
 	return nil
 }
 

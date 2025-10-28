@@ -29,6 +29,8 @@ import (
 	"net"
 )
 
+var BatchSize int
+
 type TCPConn struct{ *net.UDPConn }
 
 // Dial connects to the remote TCP port,

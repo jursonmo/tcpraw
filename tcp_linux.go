@@ -46,6 +46,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+var BatchSize int
 var (
 	errOpNotImplemented = errors.New("operation not implemented") // Error for unimplemented operations
 	errTimeout          = errors.New("timeout")                   // Error for operation timeout
@@ -224,107 +225,156 @@ func (conn *tcpConn) cleaner() {
 }
 
 func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
-	// 创建一个长度为2048字节的缓冲区，用于接收网络数据
-	buf := make([]byte, 2048)
-	// 设置gopacket解码选项：NoCopy=true表示不复制payload，Lazy=true表示延迟解码
+	var buf []byte
+	var msgs []ipv4.Message
+	if BatchSize == 0 {
+		buf = make([]byte, 2048)
+	} else {
+		log.Println("use read batch, batch size:", BatchSize)
+		msgs = make([]ipv4.Message, BatchSize)
+		for i := 0; i < BatchSize; i++ {
+			buf := make([]byte, 2048)
+			msgs[i] = ipv4.Message{Buffers: [][]byte{buf}}
+		}
+	}
+
+	//设置gopacket解码选项：NoCopy=true表示不复制payload，Lazy=true表示延迟解码
 	opt := gopacket.DecodeOptions{NoCopy: true, Lazy: true}
 	for {
-		// 从IP层读取数据到buf，返回读取到的字节数n，发送方地址addr，以及错误信息err
-		n, addr, err := handle.ReadFromIP(buf)
-		if err != nil {
-			// 发生错误时退出循环，结束函数
-			return
-		}
-
-		// 尝试把收到的buf[:n]数据解析为TCP包
-		packet := gopacket.NewPacket(buf[:n], layers.LayerTypeTCP, opt)
-		// 获取TransportLayer层（传输层）
-		transport := packet.TransportLayer()
-		// 尝试将transport（接口）断言为TCP层对象
-		tcp, ok := transport.(*layers.TCP)
-		if !ok {
-			// 如果不是TCP包，跳过本次循环
-			log.Printf("captureFlow: not TCP packet, local: %v:%d, remote: %v, len: %d\n", handle.LocalAddr().String(), port, addr.String(), n)
-			panic("not TCP packet, never happen")
-			continue
-		}
-
-		// 端口过滤，只处理目标端口等于port的TCP包.
-		// mo: TODO:对于client 而已，应该再过滤下数据报文的目的ip是否是本机ip，如果不是本机ip，则丢弃。
-		//			如果在创建handle 时，指定了源地址，那么就不需要维护多flow了， client handle 在Dial 时，应该自动绑定了源地址？
-		//      确实,对于server 而已，可能侦听了0.0.0.0:port， listen 时，创建多个handle，每个handle指定了一个本地ip作为listen源地址，handle 抓到的报文的目的ip肯定是handle 绑定的侦听ip，所以也只需要过滤port。
-		//
-		if int(tcp.DstPort) != port { //TODO: 可以在创建handle 时，传入相关参数过滤掉非该端口的tcp报文吗，这样在内核层过滤可以提高性功能
-			log.Printf("captureFlow: not target port:%d packet, local: %v:%d, remote: %v, len: %d\n", port, handle.LocalAddr().String(), int(tcp.DstPort), addr.String(), n)
-			panic("not target port packet, never happen")
-			continue
-		}
-
-		// 组装源地址，将收到包的源IP和源端口号构建为TCPAddr结构
-		var src net.TCPAddr
-		src.IP = addr.IP
-		src.Port = int(tcp.SrcPort)
-
-		var shardIndex int
-		var orphan bool // 标记该流是否“孤立”
-		// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
-		// TODO: bug, 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
-		conn.lockflow(&src, func(e *tcpFlow, sharding int) {
-			shardIndex = sharding
-			// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
-			// 如果是client, 在dial 时，会建立一个真实的tcp连接， 当时就绑定了真实tcp conn，所以e.conn不为nil
-			// 如果是server, 在真实tcp listen accept时，会建立一个真实的tcp连接， 这时才绑定了真实tcp conn，业务都是真实tcp dial成功后才发送数据，这时抓得到的数据的flow 可能不是孤立的了。
-			if e.conn == nil {
-				orphan = true
-			}
-
-			// 记录当前流的最近活动时间为当前时间
-			e.ts = time.Now()
-			// 如果收到ACK包，则记录序号
-			if tcp.ACK {
-				e.seq = tcp.Ack
-			}
-			// 如果收到SYN包，则记录下一个期待的ack值
-			if tcp.SYN {
-				log.Printf("captureFlow: SYN packet local: %v:%d, remote: %v, seq:%d ack:%d \n", handle.LocalAddr().String(), tcp.DstPort, src.String(), tcp.Seq, tcp.Ack)
-				e.ack = tcp.Seq + 1 //mo:可以认为syn是报文一个字节长度的数据，所以ack = seq + 1。后面发送的数据，ack = seq + len(data)。
-			}
-			// 如果收到PSH包，且ack与当前序号相等，则更新ack为收到的数据长度之后
-			if tcp.PSH {
-				//mo: 如果ack与当前序号相等，才更新ack, 如果对方发送还没来得及收到本端的ack, 还是会继续发送原来seq但是是新内容的数据
-				// 这对于真实是tcp socket 来说, 是重传? 但是对于tcpraw来说, 是正常行为,只需要正常处理接受的新数据就行。
-				// 但是这有个问题，真实的tcp接受到数据后，是会自动回应ack, 收到超前的seq,也会认为有报文丢失，也会发送旧ack,
-				// 这样跟tcpraw的ack不一致的话，没有问题吗? 一直不一致的话，真实socket 会不会断开连接?
-				//还是说，由于数据都是只从tcpraw发送出去的，tcpraw只有e.ack == tcp.seq 才更新ack, 如果对方发送还没来得及收到本端的ack,
-				// 还是会继续发送原来seq但是新内容的数据, 这样真实socket 只会认为重传,不会断开，而且它回应的ack 没有push标志位，不会导致tcpraw 更新ack,
-				// 但是真实tcp socket 的回应的ack 还有可能超过tcpraw 发出ack吗？不可能, 比如对方tcpraw发送了seq=50的200个字节, 然后又发送seq=5的100个字节,
-				// 本端真实tcp socket 已经更新ack=250,会认为seq=5的100个字节是重传, 但是tcpraw也更新本地ack=50+200=250, 再次收到seq=5的100个字节,不会更新ack
-				// 但是依然把seq=5的100个字节数据发供上层应用读取，在本端没有把ack=250发送给对方前，对方依然用seq=50来说发送数据，可能发送seq=50 80字节数据， 没有影响。
-				// 但是有一种情况可能会导致真实tcp socket 断开连接: tcpraw 更新了ack, 但是本地真实socket 没有更新ack, 即tcpraw ack 超过了真实socket ack, 后续的报文，真实socket 会认为数据丢失，这样会导致真实socket 断开连接。
-				// 同时真正的tcp socket 被设置ttl, 以便iptables DROP 丢弃，也就是无法发送到对方的。但是关闭真实tcp socket时，设置ttl 不为1, 这样可以关闭真实socket？ 但是本端发送fin时， 对方收到后，回应的ack ttl 也是1吗， 那对方还是发不出去啊， TODO:测试下tcp 关闭是否异常?。
-				if e.ack == tcp.Seq { //mo: 由于真实socket是不发送数据的，那么更新ack肯定是对方tcpraw 发送的.也就是导致ack更新的因素是单一的，这样保证ack的更新是正确的。
-					e.ack = tcp.Seq + uint32(len(tcp.Payload))
-				}
-			}
-			// 记录当前的网络句柄
-			e.handle = handle
-		})
-
-		// 如果此流不是孤立的，并收到PSH（说明有数据负载），则把数据推送出去
-		if !orphan && tcp.PSH {
-			// 拷贝TCP负载内容到新的切片
-			payload := make([]byte, len(tcp.Payload))
-			copy(payload, tcp.Payload)
-			_ = shardIndex
-			//log.Println("captureFlow, shardIndex:", shardIndex, "push bytes:", len(payload), "data:", string(payload))
-			// 通过通道chMessage把数据发送出来，或监听到conn.die关闭返回
-			select {
-			case conn.chMessage <- message{payload, &src}: //mo: 不是孤立才将数据发送出来，供上层应用读取, 也就上层读取到的数据是一定不是孤立的()
-			case <-conn.die:
+		if BatchSize == 0 {
+			// 从IP层读取数据到buf，返回读取到的字节数n，发送方地址addr，以及错误信息err
+			n, addr, err := handle.ReadFromIP(buf) //去掉buf中ipv4头部再返回，涉及到copy，性能不如ReadBatch
+			if err != nil {
+				// 发生错误时退出循环，结束函数
 				return
+			}
+			//fmt.Printf("handle read from ip:%s, len:%d\n", addr.String(), n)
+			conn.decodeTCPPacket(buf[:n], addr, handle, port, opt)
+		} else {
+			n, err := conn.pc.ReadBatch(msgs, 0) //recvmmsg
+			if err != nil {
+				// 发生错误时退出循环，结束函数
+				panic(err)
+			}
+			//log.Println("read batch n:", n)
+			for i, msg := range msgs[:n] {
+				_ = i
+				buf := msg.Buffers[0]
+				addr := msg.Addr.(*net.IPAddr)
+				iphlen := getIPv4HeaderLen(buf)
+				//fmt.Printf("batch:%d read from ip:%s, len:%d, ipv4 header len:%d\n", i, addr.String(), msg.N, iphlen)
+				conn.decodeTCPPacket(buf[iphlen:msg.N], addr, handle, port, opt)
 			}
 		}
 	}
+}
+
+func getIPv4HeaderLen(b []byte) int {
+	if len(b) < 20 {
+		return 0
+	}
+	if b[0]>>4 != 4 {
+		return 0 //not ipv4 packet
+	}
+	l := int(b[0]&0x0f) << 2
+	if 20 > l || l > len(b) {
+		return 0
+	}
+	return l
+}
+
+func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.IPConn, targetPort int, opt gopacket.DecodeOptions) (err error) {
+	n := len(buf)
+	// 尝试把收到的buf[:n]数据解析为TCP包
+	packet := gopacket.NewPacket(buf[:n], layers.LayerTypeTCP, opt)
+	// 获取TransportLayer层（传输层）
+	transport := packet.TransportLayer()
+	// 尝试将transport（接口）断言为TCP层对象
+	tcp, ok := transport.(*layers.TCP)
+	if !ok {
+		// 如果不是TCP包，跳过本次循环
+		log.Printf("captureFlow: not TCP packet, handle local:%v:%d, remote: %v, len: %d\n", handle.LocalAddr().String(), targetPort, addr.String(), n)
+		panic("not TCP packet, never happen")
+	}
+
+	// 端口过滤，只处理目标端口等于port的TCP包.
+	// mo:对于client 而已，应该再过滤下数据报文的目的ip是否是本机ip，如果不是本机ip，则丢弃。
+	//			如果在创建handle 时，指定了源地址，那么就不需要维护多flow了， client handle 在Dial 时，应该自动绑定了源地址？
+	//      确实,对于server 而已，可能侦听了0.0.0.0:port， listen 时，创建多个handle，每个handle指定了一个本地ip作为listen源地址，handle 抓到的报文的目的ip肯定是handle 绑定的侦听ip，所以也只需要过滤port。
+	//
+	if int(tcp.DstPort) != targetPort { //TODO: 可以在创建handle 时，传入相关参数过滤掉非该端口的tcp报文吗，这样在内核层过滤可以提高性功能
+		log.Printf("captureFlow: not target port:%d packet, local: %v, received tcp data, src port: %d, dst port: %d, remote: %v, len: %d\n",
+			targetPort, handle.LocalAddr().String(), int(tcp.SrcPort), int(tcp.DstPort), addr.String(), n)
+		panic("not target port packet, never happen") //setBpf, so here never happen
+		return fmt.Errorf("packet dst port:%d is not target port:%d , never happen", tcp.DstPort, targetPort)
+
+	}
+
+	// 组装源地址，将收到包的源IP和源端口号构建为TCPAddr结构
+	var src net.TCPAddr
+	src.IP = addr.IP
+	src.Port = int(tcp.SrcPort)
+
+	var shardIndex int
+	var orphan bool // 标记该流是否“孤立”
+	// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
+	// TODO: bug, 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
+	conn.lockflow(&src, func(e *tcpFlow, sharding int) {
+		shardIndex = sharding
+		// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
+		// 如果是client, 在dial 时，会建立一个真实的tcp连接， 当时就绑定了真实tcp conn，所以e.conn不为nil
+		// 如果是server, 在真实tcp listen accept时，会建立一个真实的tcp连接， 这时才绑定了真实tcp conn，业务都是真实tcp dial成功后才发送数据，这时抓得到的数据的flow 可能不是孤立的了。
+		if e.conn == nil {
+			orphan = true
+		}
+
+		// 记录当前流的最近活动时间为当前时间
+		e.ts = time.Now()
+		// 如果收到ACK包，则记录序号
+		if tcp.ACK {
+			e.seq = tcp.Ack
+		}
+		// 如果收到SYN包，则记录下一个期待的ack值
+		if tcp.SYN {
+			log.Printf("captureFlow: SYN packet local: %v:%d, remote: %v, seq:%d ack:%d \n", handle.LocalAddr().String(), tcp.DstPort, src.String(), tcp.Seq, tcp.Ack)
+			e.ack = tcp.Seq + 1 //mo:可以认为syn是报文一个字节长度的数据，所以ack = seq + 1。后面发送的数据，ack = seq + len(data)。
+		}
+		// 如果收到PSH包，且ack与当前序号相等，则更新ack为收到的数据长度之后
+		if tcp.PSH {
+			//mo: 如果ack与当前序号相等，才更新ack, 如果对方发送还没来得及收到本端的ack, 还是会继续发送原来seq但是是新内容的数据
+			// 这对于真实是tcp socket 来说, 是重传? 但是对于tcpraw来说, 是正常行为,只需要正常处理接受的新数据就行。
+			// 但是这有个问题，真实的tcp接受到数据后，是会自动回应ack, 收到超前的seq,也会认为有报文丢失，也会发送旧ack,
+			// 这样跟tcpraw的ack不一致的话，没有问题吗? 一直不一致的话，真实socket 会不会断开连接?
+			//还是说，由于数据都是只从tcpraw发送出去的，tcpraw只有e.ack == tcp.seq 才更新ack, 如果对方发送还没来得及收到本端的ack,
+			// 还是会继续发送原来seq但是新内容的数据, 这样真实socket 只会认为重传,不会断开，而且它回应的ack 没有push标志位，不会导致tcpraw 更新ack,
+			// 但是真实tcp socket 的回应的ack 还有可能超过tcpraw 发出ack吗？不可能, 比如对方tcpraw发送了seq=50的200个字节, 然后又发送seq=5的100个字节,
+			// 本端真实tcp socket 已经更新ack=250,会认为seq=5的100个字节是重传, 但是tcpraw也更新本地ack=50+200=250, 再次收到seq=5的100个字节,不会更新ack
+			// 但是依然把seq=5的100个字节数据发供上层应用读取，在本端没有把ack=250发送给对方前，对方依然用seq=50来说发送数据，可能发送seq=50 80字节数据， 没有影响。
+			// 但是有一种情况可能会导致真实tcp socket 断开连接: tcpraw 更新了ack, 但是本地真实socket 没有更新ack, 即tcpraw ack 超过了真实socket ack, 后续的报文，真实socket 会认为数据丢失，这样会导致真实socket 断开连接。
+			// 同时真正的tcp socket 被设置ttl, 以便iptables DROP 丢弃，也就是无法发送到对方的。但是关闭真实tcp socket时，设置ttl 不为1, 这样可以关闭真实socket？ 但是本端发送fin时， 对方收到后，回应的ack ttl 也是1吗， 那对方还是发不出去啊， TODO:测试下tcp 关闭是否异常?。
+			if e.ack == tcp.Seq { //mo: 由于真实socket是不发送数据的，那么更新ack肯定是对方tcpraw 发送的.也就是导致ack更新的因素是单一的，这样保证ack的更新是正确的。
+				e.ack = tcp.Seq + uint32(len(tcp.Payload))
+			}
+		}
+		// 记录当前的网络句柄
+		e.handle = handle
+	})
+
+	// 如果此流不是孤立的，并收到PSH（说明有数据负载），则把数据推送出去
+	if !orphan && tcp.PSH {
+		// 拷贝TCP负载内容到新的切片
+		payload := make([]byte, len(tcp.Payload))
+		copy(payload, tcp.Payload)
+		_ = shardIndex
+		//log.Println("captureFlow, shardIndex:", shardIndex, "push bytes:", len(payload), "data:", string(payload))
+		// 通过通道chMessage把数据发送出来，或监听到conn.die关闭返回
+		select {
+		case conn.chMessage <- message{payload, &src}: //mo: 不是孤立才将数据发送出来，供上层应用读取, 也就上层读取到的数据是一定不是孤立的()
+		case <-conn.die:
+			return
+		}
+	}
+	return
 }
 
 // ReadFrom implements the PacketConn ReadFrom method.
