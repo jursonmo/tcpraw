@@ -632,7 +632,8 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
-	// 使用原始 IP 层建立包捕获/发送句柄, 抓到的数据是tcp 协议的包是tcp层的数据, 包括tcp头和tcp负载， 不带ip层数据， 发送数据也是只发送tcp层的数据, 不包括ip层头部。
+	// 使用原始 IP 层建立包捕获/发送句柄, 抓到的数据是tcp 协议的包是tcp层的数据, 包括tcp头和tcp负载，不带ip层数据(其实golang net.IPConn readfrom() 自动去掉ipv4头部而已，底层socket 读到的数据是带ipv4头部的))，
+	// 发送数据也是只发送tcp层的数据, 不包括ip层头部, 内核会自动添加ip层头部。
 	handle, err := net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP}) //mo:抓取的是所有tcp包，多个client都这么做，是不是性能会下降? 指定了目的ip, 应该只抓取目的ip的tcp包.
 	//mo:handle 会自动绑定一个本地ip地址(不包含端口)，可以通过 handle.LocalAddr() 获取。在writeTo 时，需要使用这个本地地址来生成tcp校验头部, 源端口只能通过真实tcp socket 的本地端口。
 	if err != nil {
