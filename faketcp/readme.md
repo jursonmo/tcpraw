@@ -1,7 +1,8 @@
 ### tcpraw 实现逻辑：
 #### client:
-   + Dial :  net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP}), 指定Dial的目的ip 会生成handle, DialTCP 生成真是 realtcpsocket, handle 和 realtcpsocket 都会自动绑定一个本地ip地址，他们应该是一样的，只是真实tcp还自动绑定本地端口。通过真实tcp socket可以得到本端绑定端口, 在handle抓包时，可以根据这个端口过滤掉非该端口的tcp报文
-           真实tcp拨号成功后，会创建一个flow, 并且记录flow.conn = realtcpsocket, 以此说明该flow不是孤儿。只有不是孤儿的flow的数据才push推送到上层业务
+   + Dial :  net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP}), 指定Dial的目的ip 会生成handle, DialTCP 生成真是 realtcpsocket, handle 和 realtcpsocket 都会自动绑定一个本地ip地址，他们应该是一样的，只是真实tcp还自动绑定本地端口。通过真实tcp socket可以得到本端绑定端口, 在handle抓包时，可以根据这个端口过滤掉非该端口的tcp报文。
+        真实tcp拨号成功后，会创建一个flow, 并且记录flow.conn = realtcpsocket, 以此说明该flow不是孤儿。只有不是孤儿的flow的数据才push推送到上层业务。也就是真实建立三次握手成功的flow 的数据才会被业务层读到。
+    + handle := net.DialIP("ip:tcp"..), 从handle.ReadFromIp()的角度看收到的是tcp的数据。其实底层套接字读到的数据是包含ip头部的，只是golang c.fd.readFrom(b)->stripIPv4Header()把ip头部去掉了而已，也就是在给套接字设置bpf时，是要从ip头部开始设置bpf字节码。
     + handle 是一个原始套接字，有队列的，也就是真实tcp 拨号成功后再调用handle.captureFlow(),也是能看到握手过程中对方发送的syn 和 ack, 因为这些数据已经在handle对应的内核队列里了。可以根据这些报文更新seq ack.
     + 真实tcp 拨号成功后，设置socketopt ttl = 1, 然后配置iptables 把ttl为1的数据drop,实际就是drop掉所有真实tcp的报文。
     + handle 抓到数据后，根据对方数据的seq 是否等于flow记录的ack,才更新ack. 判断不是孤儿的flow的数据，就可以往上推送给业务层。
@@ -31,4 +32,5 @@
 8. 性能优化: 
    + 8.1 从抓包读到的数据报文到送到业务层，发生的拷贝次数有点多，可以适当减少。
    + 8.2 现在是在抓包后再过滤掉不想要的tcp端口的数据，最好是在内核层面过滤，使用socket BPF, 这样提高抓包的有效性。否则handle.cpatureflow会抓到对应ip非常多的tcp报文，但是都不是指定的tcp端口的报文，效率非常低。
-   + 8.3 为了提高从内核读数据的效率，使用PacketConn.ReadBatch()调用底层recvmmsg：一次系统调用读到多个报文.（DONE)
+   + 8.3 为了提高从内核读数据的效率，使用PacketConn.ReadBatch()调用底层recvmmsg：一次系统调用读到多个报文.（DONE)(先实现批量读，暂时不要考虑批量写，根据系统性能单个写数据， 但是批量读也有必要，不然来不及从内核队列里读取数据，就会被丢弃)
+   + 8.4 给listener 可以增加REUSEADDR特性, 这样可以使多个listener侦听一个本地地址，其到负载作用吗？答:经过验证，原始套接字，使用 SO_REUSEPORT 并不能实现真正的负载均衡，多个原始套接字会收到相同的数据包副本。 为什么不能负载均衡 1. 数据包复制：内核将每个匹配的数据包复制到所有绑定的原始套接字 2.无分发逻辑：原始套接字没有像 TCP/UDP 那样的连接或流的概念

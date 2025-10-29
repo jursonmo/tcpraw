@@ -44,6 +44,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 var BatchSize int
@@ -90,9 +91,10 @@ type tcpConn struct {
 	dieOnce sync.Once
 
 	// the main golang sockets
-	tcpconn  *net.TCPConn     // from net.Dial
-	listener *net.TCPListener // from net.Listen
-	pc       *ipv4.PacketConn
+	tcpconn      *net.TCPConn     // from net.Dial
+	listener     *net.TCPListener // from net.Listen
+	pc           *ipv4.PacketConn
+	reuseportNum int
 
 	// handles
 	handles []*net.IPConn
@@ -224,10 +226,10 @@ func (conn *tcpConn) cleaner() {
 	}
 }
 
-func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
+func (conn *tcpConn) captureFlow(pc *ipv4.PacketConn, handleId int, handle *net.IPConn, port int) {
 	var buf []byte
 	var msgs []ipv4.Message
-	if BatchSize == 0 {
+	if BatchSize < 2 {
 		buf = make([]byte, 2048)
 	} else {
 		log.Println("use read batch, batch size:", BatchSize)
@@ -241,7 +243,7 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 	//设置gopacket解码选项：NoCopy=true表示不复制payload，Lazy=true表示延迟解码
 	opt := gopacket.DecodeOptions{NoCopy: true, Lazy: true}
 	for {
-		if BatchSize == 0 {
+		if pc == nil || BatchSize < 2 {
 			// 从IP层读取数据到buf，返回读取到的字节数n，发送方地址addr，以及错误信息err
 			n, addr, err := handle.ReadFromIP(buf) //去掉buf中ipv4头部再返回，涉及到copy，性能不如ReadBatch
 			if err != nil {
@@ -251,12 +253,12 @@ func (conn *tcpConn) captureFlow(handle *net.IPConn, port int) {
 			//fmt.Printf("handle read from ip:%s, len:%d\n", addr.String(), n)
 			conn.decodeTCPPacket(buf[:n], addr, handle, port, opt)
 		} else {
-			n, err := conn.pc.ReadBatch(msgs, 0) //recvmmsg
+			n, err := pc.ReadBatch(msgs, 0) //recvmmsg
 			if err != nil {
 				// 发生错误时退出循环，结束函数
 				panic(err)
 			}
-			//log.Println("read batch n:", n)
+			log.Printf("handleId:%d read batch n:%d\n", handleId, n)
 			for i, msg := range msgs[:n] {
 				_ = i
 				buf := msg.Buffers[0]
@@ -369,7 +371,7 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 		//log.Println("captureFlow, shardIndex:", shardIndex, "push bytes:", len(payload), "data:", string(payload))
 		// 通过通道chMessage把数据发送出来，或监听到conn.die关闭返回
 		select {
-		case conn.chMessage <- message{payload, &src}: //mo: 不是孤立才将数据发送出来，供上层应用读取, 也就上层读取到的数据是一定不是孤立的()
+		case conn.chMessage <- message{payload, &src}: //mo: 不是孤立才将数据发送出来，供上层应用读取, 也就是上层读取到的数据一定不是孤立的()
 		case <-conn.die:
 			return
 		}
@@ -683,7 +685,7 @@ func Dial(network, address string) (*TCPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	go conn.captureFlow(handle, tcpconn.LocalAddr().(*net.TCPAddr).Port)
+	go conn.captureFlow(conn.pc, 0, handle, tcpconn.LocalAddr().(*net.TCPAddr).Port)
 	go conn.cleaner()
 
 	// 初始化 iptables 规则，保证 TTL=1 的包来自该 socket 会被立即丢弃。
@@ -754,6 +756,9 @@ func Listen(network, address string) (*TCPConn, error) {
 	}
 	conn.tcpFingerPrint = fingerPrintLinux
 
+	conn.reuseportNum = 1 //原始套接字，使用 SO_REUSEPORT 并不能实现真正的负载均衡，多个原始套接字会收到相同的数据包副本。
+	log.Println("reuseport enabled, reuseport num:", conn.reuseportNum)
+
 	// resolve address
 	laddr, err := net.ResolveTCPAddr(network, address)
 	if err != nil {
@@ -774,7 +779,7 @@ func Listen(network, address string) (*TCPConn, error) {
 					if ipaddr, ok := addr.(*net.IPNet); ok {
 						if handle, err := net.ListenIP("ip:tcp", &net.IPAddr{IP: ipaddr.IP}); err == nil {
 							conn.handles = append(conn.handles, handle)
-							go conn.captureFlow(handle, laddr.Port)
+							go conn.captureFlow(nil, 0, handle, laddr.Port)
 						} else {
 							lasterr = err
 						}
@@ -786,17 +791,31 @@ func Listen(network, address string) (*TCPConn, error) {
 			return nil, lasterr
 		}
 	} else {
-		if handle, err := net.ListenIP("ip:tcp", &net.IPAddr{IP: laddr.IP}); err == nil {
-			conn.pc = ipv4.NewPacketConn(handle)
-			err = SetBPFFilterPortByPacketConn(conn.pc, uint32(laddr.Port))
-			//err = SetBPFFilterPort(handle, uint32(laddr.Port))
-			if err != nil {
+		//mo: 实验证明,原始套接字，使用 SO_REUSEPORT 并不能实现真正的负载均衡, 这里的reuseportNum==1, 只创建一个原始套接字。
+		for i := 0; i < conn.reuseportNum; i++ {
+			if handle, err := net.ListenIP("ip:tcp", &net.IPAddr{IP: laddr.IP}); err == nil {
+				raw, err := handle.SyscallConn()
+				if err != nil {
+					return nil, err
+				}
+				raw.Control(func(fd uintptr) {
+					err = syscall.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1) //reuseport flag
+				})
+				if err != nil {
+					panic(err)
+					return nil, err
+				}
+				pc := ipv4.NewPacketConn(handle)
+				err = SetBPFFilterPortByPacketConn(pc, uint32(laddr.Port))
+				//err = SetBPFFilterPort(handle, uint32(laddr.Port))
+				if err != nil {
+					return nil, err
+				}
+				conn.handles = append(conn.handles, handle)
+				go conn.captureFlow(pc, i, handle, laddr.Port)
+			} else {
 				return nil, err
 			}
-			conn.handles = append(conn.handles, handle)
-			go conn.captureFlow(handle, laddr.Port)
-		} else {
-			return nil, err
 		}
 	}
 
