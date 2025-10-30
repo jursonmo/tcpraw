@@ -20,7 +20,7 @@
 ### TODO:
 1. 锁：
    + 1.1 tcpraw flowtable 改成读写锁，且最好把锁sharding成多个锁，避免锁竞争。(DONE)
-   + 1.2 减低锁的颗粒度，在captureFlow()-->lockflow()更新flow seq ack时，都是在锁的保护下，可以不用在锁的保护，把flow seq ack 放在flow自己的锁里，或者用atomic 原子操作更新。 
+   + 1.2 减低锁的颗粒度，在captureFlow()-->lockflow()更新flow seq ack和发送数据时，都是在flowTable锁的保护下，多个不同的流会竞争flowTable锁， 为了减少不同流之间的锁竞争，把flow seq ack 的更新放在flow自己的锁里。(DONE) 
 2. 由于为了业务层更方便接入，把流封装成net.Conn. (DONE)
 3. bug: 
     + 3.1 对于服务端而已, 只以对端的信息作为flow 的key, 不需要本地ip和端口吗? 那么如果服务端侦听多个本地地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。

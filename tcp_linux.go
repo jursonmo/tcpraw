@@ -68,6 +68,7 @@ type message struct {
 
 // a tcp flow information of a connection pair
 type tcpFlow struct {
+	sync.Mutex
 	conn         *net.TCPConn               // the related system TCP connection of this flow
 	handle       *net.IPConn                // the handle to send packets
 	seq          uint32                     // TCP sequence number
@@ -196,9 +197,8 @@ func (conn *tcpConn) getflow(key addrKey, f func(e *tcpFlow, shardIndex int)) {
 	if !ok {
 		fmt.Printf("getflow not found: %v, shardIndex: %d\n", key, shardIndex)
 	}
-	f(e, shardIndex)
-	// Apply the function to the flow entry
 	conn.flowsLocks[shardIndex].RUnlock() // Unlock the flowTable
+	f(e, shardIndex)
 }
 
 // lockflow locks the flow table and apply function `f` to the entry, and create one if not exist
@@ -221,9 +221,9 @@ func (conn *tcpConn) lockflow(key addrKey, f func(e *tcpFlow, shardIndex int)) {
 		}
 		//end by mo
 	}
-	f(e, shardIndex)                     // Apply the function to the flow entry
 	conn.flowTables[shardIndex][key] = e // Store the modified flow entry back into the table
 	conn.flowsLocks[shardIndex].Unlock() // Unlock the flowTable
+	f(e, shardIndex)                     // Apply the function to the flow entry
 }
 
 // clean expired flows
@@ -366,6 +366,8 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 	// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
 	// TODO: bug, 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
 	conn.lockflow(key, func(e *tcpFlow, sharding int) {
+		e.Lock()
+		defer e.Unlock()
 		shardIndex = sharding
 		// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
 		// 如果是client, 在dial 时，会建立一个真实的tcp连接， 当时就绑定了真实tcp conn，所以e.conn不为nil
@@ -488,6 +490,8 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 				err = ErrFlowNotFound
 				return
 			}
+			e.Lock()
+			defer e.Unlock()
 			// if the flow doesn't have handle , assume this packet has lost, without notification
 			if e.handle == nil { //mo: 经过captureFlow 捕获过的flow 都有handle, 没有handle的flow说明是本端主动发送一个全新的包， 理论上不应该发送， 应该返回错误。
 				//n = len(p) //mo: 这里不返回n = len(p)，而是返回 n=0， 这样上层应用可以根据返回的n=0，来判断是否重新发送数据。
@@ -530,6 +534,10 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			} else {
 				_, err = e.handle.WriteToIP(e.buf.Bytes(), &net.IPAddr{IP: raddr.IP})
 			}
+			if err != nil {
+				return
+			}
+
 			// increase seq in flow
 			e.seq += uint32(len(p))
 			n = len(p)
