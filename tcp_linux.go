@@ -460,10 +460,14 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, io.EOF
 	default:
 		//raddr, err := net.ResolveTCPAddr("tcp", addr.String())
-		var raddr *net.TCPAddr
-		raddr, err = net.ResolveTCPAddr("tcp", addr.String())
-		if err != nil {
-			return 0, err
+		// var raddr *net.TCPAddr
+		// raddr, err = net.ResolveTCPAddr("tcp", addr.String())
+		// if err != nil {
+		// 	return 0, err
+		// }
+		raddr, ok := addr.(*net.TCPAddr)
+		if !ok {
+			return 0, fmt.Errorf("addr is not a tcp address")
 		}
 
 		var lport int
