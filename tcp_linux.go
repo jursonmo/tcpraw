@@ -104,7 +104,7 @@ type tcpConn struct {
 
 	// all TCP flows
 	sharding   int
-	flowTables []map[string]*tcpFlow
+	flowTables []map[addrKey]*tcpFlow
 	flowsLocks []sync.RWMutex
 
 	// iptables
@@ -127,13 +127,13 @@ type tcpConn struct {
 func (conn *tcpConn) initFlowTable(sharding int) {
 	conn.sharding = sharding
 	conn.flowsLocks = make([]sync.RWMutex, sharding)
-	conn.flowTables = make([]map[string]*tcpFlow, sharding)
+	conn.flowTables = make([]map[addrKey]*tcpFlow, sharding)
 	for i := 0; i < sharding; i++ {
-		conn.flowTables[i] = make(map[string]*tcpFlow)
+		conn.flowTables[i] = make(map[addrKey]*tcpFlow)
 	}
 }
 
-func addrToNumber(addr net.Addr) uint64 {
+func addrToHashNumber(addr net.Addr) uint64 {
 	tcpAddr, ok := addr.(*net.TCPAddr)
 	if !ok {
 		panic("addr is not a tcp address")
@@ -144,19 +144,57 @@ func addrToNumber(addr net.Addr) uint64 {
 		return 0
 	}
 	ip := binary.BigEndian.Uint32(ip4)
+	ip ^= ip >> 20
+	ip ^= ip >> 14
+	ip ^= ip >> 9
 	return uint64(ip) + uint64(tcpAddr.Port) //TODO:优化算法，让低三位更加分散。因为我们要& (conn.sharding - 1)
+}
+
+func addrSplit(addr net.Addr) (ip uint32, port uint16) {
+	if addr == nil {
+		return 0, 0
+	}
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		panic("addr is not a tcp address")
+	}
+	ip4 := tcpAddr.IP.To4()
+	if ip4 == nil {
+		//it is ipv6, just support ipv4 for now
+		return 0, 0
+	}
+	ip = binary.BigEndian.Uint32(ip4)
+	return ip, uint16(tcpAddr.Port)
+}
+
+// 4 tuple key for flow table
+type addrKey struct {
+	//sip   uint32
+	dip uint32
+	//sport uint16
+	dport uint16
+}
+
+func (key *addrKey) HashNumber() int {
+	ip := key.dip
+	port := key.dport
+	ip ^= ip >> 20
+	ip ^= ip >> 14
+	ip ^= ip >> 9
+	return int(ip) + int(port)
 }
 
 // add by mo: 发送数据时，获取flow表项，如果flow表项不存在，则返回错误。可以认为底层连接断开了。
 // 多个任务同时发送数据WriteTo时，可以避免锁竞争。
-func (conn *tcpConn) getflow(addr net.Addr, f func(e *tcpFlow, shardIndex int)) {
-	addrNum := addrToNumber(addr)
-	shardIndex := int(addrNum) & (conn.sharding - 1)
-	key := addr.String()                // Use the string representation of the address as the key
+func (conn *tcpConn) getflow(key addrKey, f func(e *tcpFlow, shardIndex int)) {
+	// addrNum := addrToHashNumber(addr)
+	// shardIndex := int(addrNum) & (conn.sharding - 1)
+	// key := addr.String()                // Use the string representation of the address as the key
+	shardIndex := key.HashNumber() & (conn.sharding - 1)
 	conn.flowsLocks[shardIndex].RLock() // Lock the flowTable for safe access
 	e, ok := conn.flowTables[shardIndex][key]
 	if !ok {
-		fmt.Printf("getflow not found: %v, shardIndex: %d\n", addr.String(), shardIndex)
+		fmt.Printf("getflow not found: %v, shardIndex: %d\n", key, shardIndex)
 	}
 	f(e, shardIndex)
 	// Apply the function to the flow entry
@@ -164,10 +202,11 @@ func (conn *tcpConn) getflow(addr net.Addr, f func(e *tcpFlow, shardIndex int)) 
 }
 
 // lockflow locks the flow table and apply function `f` to the entry, and create one if not exist
-func (conn *tcpConn) lockflow(addr net.Addr, f func(e *tcpFlow, shardIndex int)) {
-	addrNum := addrToNumber(addr)
-	shardIndex := int(addrNum) & (conn.sharding - 1)
-	key := addr.String()               // Use the string representation of the address as the key
+func (conn *tcpConn) lockflow(key addrKey, f func(e *tcpFlow, shardIndex int)) {
+	// addrNum := addrToHashNumber(addr)
+	// shardIndex := int(addrNum) & (conn.sharding - 1)
+	// key := addr.String()  // Use the string representation of the address as the key //mo: 这种方式会产生很多小对象，不利于gc
+	shardIndex := key.HashNumber() & (conn.sharding - 1)
 	conn.flowsLocks[shardIndex].Lock() // Lock the flowTable for safe access
 	e := conn.flowTables[shardIndex][key]
 	if e == nil { // entry first visit
@@ -317,11 +356,16 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 	src.IP = addr.IP
 	src.Port = int(tcp.SrcPort)
 
+	key := addrKey{
+		dip:   binary.BigEndian.Uint32(src.IP.To4()),
+		dport: uint16(src.Port),
+	}
+
 	var shardIndex int
 	var orphan bool // 标记该流是否“孤立”
 	// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
 	// TODO: bug, 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
-	conn.lockflow(&src, func(e *tcpFlow, sharding int) {
+	conn.lockflow(key, func(e *tcpFlow, sharding int) {
 		shardIndex = sharding
 		// 如果e.conn为nil，说明这个流还未关联底层net.TCPConn，则标记为孤立
 		// 如果是client, 在dial 时，会建立一个真实的tcp连接， 当时就绑定了真实tcp conn，所以e.conn不为nil
@@ -338,7 +382,7 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 		}
 		// 如果收到SYN包，则记录下一个期待的ack值
 		if tcp.SYN {
-			log.Printf("captureFlow: SYN packet local: %v:%d, remote: %v, seq:%d ack:%d \n", handle.LocalAddr().String(), tcp.DstPort, src.String(), tcp.Seq, tcp.Ack)
+			log.Printf("captureFlow, shardIndex:%d, SYN packet local: %v:%d, remote: %v, seq:%d ack:%d \n", shardIndex, handle.LocalAddr().String(), tcp.DstPort, src.String(), tcp.Seq, tcp.Ack)
 			e.ack = tcp.Seq + 1 //mo:可以认为syn是报文一个字节长度的数据，所以ack = seq + 1。后面发送的数据，ack = seq + len(data)。
 		}
 		// 如果收到PSH包，且ack与当前序号相等，则更新ack为收到的数据长度之后
@@ -429,8 +473,13 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			lport = conn.listener.Addr().(*net.TCPAddr).Port
 		}
 
+		ip, port := addrSplit(addr)
+		key := addrKey{
+			dip:   ip,
+			dport: port,
+		}
 		//conn.lockflow(addr, func(e *tcpFlow) {
-		conn.getflow(addr, func(e *tcpFlow, shardIndex int) {
+		conn.getflow(key, func(e *tcpFlow, shardIndex int) {
 			if e == nil {
 				err = ErrFlowNotFound
 				return
@@ -670,7 +719,12 @@ func Dial(network, address string) (*TCPConn, error) {
 	conn.initFlowTable(1)
 	conn.tcpconn = tcpconn
 	conn.chMessage = make(chan message)
-	conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow, _ int) { e.conn = tcpconn }) //mo: 创建flow表项，并关联底层net.TCPConn
+	ip, port := addrSplit(tcpconn.RemoteAddr())
+	key := addrKey{
+		dip:   ip,
+		dport: port,
+	}
+	conn.lockflow(key, func(e *tcpFlow, _ int) { e.conn = tcpconn }) //mo: 创建flow表项，并关联底层net.TCPConn
 	conn.handles = append(conn.handles, handle)
 	conn.opts = gopacket.SerializeOptions{
 		FixLengths:       true,
@@ -870,7 +924,12 @@ func Listen(network, address string) (*TCPConn, error) {
 			}
 
 			// record net.Conn
-			conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow, _ int) { e.conn = tcpconn })
+			ip, port := addrSplit(tcpconn.RemoteAddr())
+			key := addrKey{
+				dip:   ip,
+				dport: port,
+			}
+			conn.lockflow(key, func(e *tcpFlow, _ int) { e.conn = tcpconn })
 
 			// discard everything
 			go io.Copy(ioutil.Discard, tcpconn)
