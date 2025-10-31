@@ -14,6 +14,15 @@ func Dial(network, address string) (net.Conn, error) {
 		return nil, err
 	}
 
+	err = conn.SetReadBuffer(1024 * 1024 * 3)
+	if err != nil {
+		return nil, err
+	}
+	err = conn.SetWriteBuffer(1024 * 1024 * 3)
+	if err != nil {
+		return nil, err
+	}
+
 	remoteAddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
 		return nil, err

@@ -292,7 +292,7 @@ func (l *Listener) acceptDataLoop() {
 			data := make([]byte, n)
 			copy(data, buf[:n])
 			log.Println("listener push bytes:", n, "data:", string(data))
-			fc.Push(data)
+			fc.Push(data) //非阻塞。避免影响后面其他流的数据的读取。
 			continue
 		}
 		l.mu.RUnlock()
