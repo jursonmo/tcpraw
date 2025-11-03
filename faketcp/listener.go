@@ -304,7 +304,7 @@ func (l *Listener) acceptDataLoop() {
 			laddr:    l.laddr,
 			addr:     addr,
 			fakeConn: l.fakeConn,
-			recvch:   make(chan []byte, 1024),
+			recvch:   make(chan []byte, 2048),
 			sendch:   make(chan []byte, 1024),
 		}
 		// go fc.readLoop()
