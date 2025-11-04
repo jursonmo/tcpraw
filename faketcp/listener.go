@@ -304,7 +304,7 @@ func (l *Listener) acceptDataLoop() {
 			laddr:    l.laddr,
 			addr:     addr,
 			fakeConn: l.fakeConn,
-			recvch:   make(chan []byte, 2048),
+			recvch:   make(chan []byte, 2048), //put操作是非阻塞, 队列满马上丢弃,所以这里设置大一点，避免队列满而drop数据。
 			sendch:   make(chan []byte, 1024),
 		}
 		// go fc.readLoop()
