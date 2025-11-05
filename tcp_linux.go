@@ -346,9 +346,8 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 	if int(tcp.DstPort) != targetPort { //TODO: 可以在创建handle 时，传入相关参数过滤掉非该端口的tcp报文吗，这样在内核层过滤可以提高性功能
 		log.Printf("captureFlow: not target port:%d packet, local: %v, received tcp data, src port: %d, dst port: %d, remote: %v, len: %d\n",
 			targetPort, handle.LocalAddr().String(), int(tcp.SrcPort), int(tcp.DstPort), addr.String(), n)
-		panic("not target port packet, never happen") //setBpf, so here never happen
+		//panic("not target port packet, never happen") //setBpf, so here never happen; 但是有一种情况是client同时向同一个服务器发起连接，同时创建多个handle，还没来得及设置bpf，数据已经到达本地并存放handle 对应的队列中, 就收到了非目标端口的报文, 这种情况应该如何处理？这里暂时不panic.
 		return fmt.Errorf("packet dst port:%d is not target port:%d , never happen", tcp.DstPort, targetPort)
-
 	}
 
 	// 组装源地址，将收到包的源IP和源端口号构建为TCPAddr结构
@@ -744,7 +743,7 @@ func Dial(network, address string) (*TCPConn, error) {
 	}
 	conn.tcpFingerPrint = fingerPrintLinux
 
-	// add by mo: 在handle 创建时，设置BPF过滤器，只抓取指定端口的tcp报文，提高抓包效率。
+	// add by mo: 在handle 创建时，设置BPF过滤器，只抓取指定端口的tcp报文，提高抓包效率。但是在创建handle 和 setBpf 之间, 可能会收到非目标端口的报文。
 	conn.pc = ipv4.NewPacketConn(handle)
 	err = SetBPFFilterPortByPacketConn(conn.pc, uint32(tcpconn.LocalAddr().(*net.TCPAddr).Port))
 	// err = SetBPFFilterPort(handle, uint32(tcpconn.LocalAddr().(*net.TCPAddr).Port))
