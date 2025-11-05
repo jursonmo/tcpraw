@@ -1,4 +1,4 @@
-module github.com/xtaci/tcpraw
+module github.com/jursonmo/tcpraw
 
 go 1.13
 

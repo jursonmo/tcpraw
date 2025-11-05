@@ -8,8 +8,8 @@ import (
 	"net"
 	"os"
 
-	"github.com/xtaci/tcpraw"
-	"github.com/xtaci/tcpraw/faketcp"
+	"github.com/jursonmo/tcpraw"
+	"github.com/jursonmo/tcpraw/faketcp"
 )
 
 var (
@@ -28,8 +28,12 @@ func main() {
 	}
 
 	ctx := context.Background()
-	l := faketcp.NewFakeTcpListener(ctx)
-	if err := l.Listen(*addr); err != nil {
+	// l := faketcp.NewFakeTcpListener(ctx)
+	// if err := l.Listen(*addr); err != nil {
+	// 	panic(err)
+	// }
+	l, err := faketcp.FakeTcpListen(ctx, *addr)
+	if err != nil {
 		panic(err)
 	}
 	log.Println("server listening on:", *addr)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -8,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/xtaci/tcpraw"
-	"github.com/xtaci/tcpraw/faketcp"
+	"github.com/jursonmo/tcpraw"
+	"github.com/jursonmo/tcpraw/faketcp"
 )
 
 var (
@@ -28,8 +29,8 @@ func main() {
 		tcpraw.BatchSize = *batchSize
 	}
 
-	//ctx := context.Background()
-	conn, err := faketcp.Dial("", *addr)
+	ctx := context.Background()
+	conn, err := faketcp.Dial(ctx, *addr)
 	if err != nil {
 		panic(err)
 	}

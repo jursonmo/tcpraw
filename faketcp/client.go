@@ -1,14 +1,16 @@
 package faketcp
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
 
-	"github.com/xtaci/tcpraw"
+	"github.com/jursonmo/tcpraw"
 )
 
-func Dial(network, address string) (net.Conn, error) {
+// TODO: 增加context 支持
+func Dial(ctx context.Context, address string) (net.Conn, error) {
 	conn, err := tcpraw.Dial("tcp", address) //真实tcp 连接成功才返回conn, 否则返回nil, err
 	if err != nil {
 		return nil, err

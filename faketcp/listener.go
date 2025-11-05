@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtaci/tcpraw"
+	"github.com/jursonmo/tcpraw"
 )
 
 type FakeConn struct {
@@ -122,6 +122,8 @@ func (f *FakeConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+var _ net.Listener = (*Listener)(nil)
+
 type Listener struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -136,6 +138,15 @@ type Listener struct {
 	connChan chan *FakeConn
 }
 
+// FakeTcpListen 其实是合并 l :=NewFakeTcpListener 和 l.Listen(), 更加方便使用。
+func FakeTcpListen(ctx context.Context, addr string) (*Listener, error) {
+	l := NewFakeTcpListener(ctx)
+	if err := l.Listen(addr); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
 func NewFakeTcpListener(ctx context.Context) *Listener {
 	ctx, cancel := context.WithCancel(ctx)
 	return &Listener{
@@ -143,11 +154,17 @@ func NewFakeTcpListener(ctx context.Context) *Listener {
 		cancel:   cancel,
 		connMap:  make(map[string]*FakeConn, 128),
 		connChan: make(chan *FakeConn, 2048),
+		delayMap: make(map[*FakeConn]time.Time, 128),
 	}
 }
 
 func (l *Listener) String() string {
 	return fmt.Sprintf("listener: %s, connMap: %d", l.laddr.String(), len(l.connMap))
+}
+
+// 实现 net.Listener 接口Addr 方法
+func (l *Listener) Addr() net.Addr {
+	return l.laddr
 }
 
 /*
@@ -291,7 +308,7 @@ func (l *Listener) acceptDataLoop() {
 			l.mu.RUnlock()
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			log.Println("listener push bytes:", n, "data:", string(data))
+			//log.Println("listener push bytes:", n, "data:", string(data))
 			fc.Push(data) //非阻塞。避免影响后面其他流的数据的读取。
 			continue
 		}
