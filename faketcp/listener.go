@@ -68,9 +68,12 @@ func (f *FakeConn) Push(b []byte) {
 		return
 	}
 }
-
 func (f *FakeConn) Write(b []byte) (int, error) {
-	n, err := f.fakeConn.WriteTo(b, f.addr)
+	return f.WriteTo(b, f.addr)
+}
+
+func (f *FakeConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	n, err := f.fakeConn.WriteTo(b, addr)
 	if err != nil {
 		return 0, err
 	}
