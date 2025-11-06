@@ -22,6 +22,7 @@ type FakeConn struct {
 	addr     net.Addr
 	fakeConn *tcpraw.TCPConn
 	recvch   chan []byte
+	recvLeft []byte
 	sendch   chan []byte
 
 	ts          time.Time
@@ -48,11 +49,26 @@ func (f *FakeConn) GetDropRxBytes() uint64 {
 	return f.dropRxBytes
 }
 
+// 业务层ReadFull, 不一定一次读取完, 先返回recvLeft, 再从recvch 中读取数据
 func (f *FakeConn) Read(b []byte) (int, error) {
+	f.Lock()
+	defer f.Unlock()
+	// 先返回recvLeft
+	if len(f.recvLeft) > 0 {
+		n := copy(b, f.recvLeft)
+		f.recvLeft = f.recvLeft[n:]
+		f.rxBytes += uint64(n)
+		return n, nil
+	}
+
 	select {
 	case data := <-f.recvch:
 		n := copy(b, data)
-		f.rxBytes += uint64(len(b))
+		// 剩余数据保存到recvLeft
+		if n < len(data) {
+			f.recvLeft = data[n:]
+		}
+		f.rxBytes += uint64(n)
 		return n, nil
 	case <-f.ctx.Done():
 		return 0, errors.New("context done")
@@ -295,7 +311,7 @@ func (l *Listener) FatchOneFakeConn() (*FakeConn, error) {
 func (l *Listener) acceptDataLoop() {
 	defer l.Close() //mo: last defer, 最后执行关闭listener。
 	defer l.wg.Done()
-	buf := make([]byte, 2048)
+	buf := make([]byte, tcpraw.MaxPayloadSize)
 	for {
 		n, addr, err := l.fakeConn.ReadFrom(buf)
 		if err != nil {
