@@ -47,7 +47,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var BatchSize int
+var BatchSize int = 4
+var MaxPayloadSize int = 52048 // 2048 //如果对方不会发送大报文，建议设置为2048
 var (
 	errOpNotImplemented = errors.New("operation not implemented") // Error for unimplemented operations
 	errTimeout          = errors.New("timeout")                   // Error for operation timeout
@@ -269,12 +270,12 @@ func (conn *tcpConn) captureFlow(pc *ipv4.PacketConn, handleId int, handle *net.
 	var buf []byte
 	var msgs []ipv4.Message
 	if BatchSize < 2 {
-		buf = make([]byte, 2048)
+		buf = make([]byte, MaxPayloadSize)
 	} else {
 		log.Println("use read batch, batch size:", BatchSize)
 		msgs = make([]ipv4.Message, BatchSize)
 		for i := 0; i < BatchSize; i++ {
-			buf := make([]byte, 2048)
+			buf := make([]byte, MaxPayloadSize)
 			msgs[i] = ipv4.Message{Buffers: [][]byte{buf}}
 		}
 	}
@@ -297,7 +298,7 @@ func (conn *tcpConn) captureFlow(pc *ipv4.PacketConn, handleId int, handle *net.
 				// 发生错误时退出循环，结束函数
 				panic(err)
 			}
-			log.Printf("handleId:%d read batch n:%d\n", handleId, n)
+			//log.Printf("handleId:%d read batch n:%d\n", handleId, n)
 			for i, msg := range msgs[:n] {
 				_ = i
 				buf := msg.Buffers[0]
@@ -361,7 +362,7 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 	}
 
 	var shardIndex int
-	var orphan bool // 标记该流是否“孤立”
+	var orphan bool // 标记该流是否“孤立”, 即有没有关联到真是的tcp连接
 	// 流表维护。 通过对端ip和端口，找到对应的tcpFlow， 然后更新tcpFlow的状态。
 	// TODO: bug, 以对端的信息作为key, 不需要本地ip和端口吗? 那么如果服务端侦听本地多地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。
 	conn.lockflow(key, func(e *tcpFlow, sharding int) {
@@ -411,6 +412,13 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 	if !orphan && tcp.PSH {
 		// 拷贝TCP负载内容到新的切片
 		payload := make([]byte, len(tcp.Payload))
+		if len(tcp.Payload) > 10000 { //分片重组后, 可能会超过10000字节
+			log.Printf("tcp payload len > 10000, len:%d", len(tcp.Payload))
+		}
+		//test, 限制tcp payload 不能超过或等于MaxPayloadSize, 这样说明有截断, 这里先panic
+		if len(tcp.Payload) >= MaxPayloadSize {
+			panic("tcp payload len > MaxPayloadSize")
+		}
 		copy(payload, tcp.Payload)
 		_ = shardIndex
 		//log.Println("captureFlow, shardIndex:", shardIndex, "push bytes:", len(payload), "data:", string(payload))
@@ -529,9 +537,12 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			e.buf.Clear()
 			gopacket.SerializeLayers(e.buf, conn.opts, &e.tcpHeader, gopacket.Payload(p))
 			if conn.tcpconn != nil {
-				_, err = e.handle.Write(e.buf.Bytes()) //mo: 说明是client端，发送数据到对方, client dialIp 是指定了目的ip, 所以发送数据是直接发送给对方。
+				n, err = e.handle.Write(e.buf.Bytes()) //mo: 说明是client端，发送数据到对方, client dialIp 是指定了目的ip, 所以发送数据是直接发送给对方。
 			} else {
-				_, err = e.handle.WriteToIP(e.buf.Bytes(), &net.IPAddr{IP: raddr.IP})
+				n, err = e.handle.WriteToIP(e.buf.Bytes(), &net.IPAddr{IP: raddr.IP})
+			}
+			if n != len(e.buf.Bytes()) {
+				panic(fmt.Sprintf("tcpraw write len != payload len, write len:%d, payload len:%d", n, len(p)))
 			}
 			if err != nil {
 				return
