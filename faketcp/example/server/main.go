@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/jursonmo/tcpraw"
 	"github.com/jursonmo/tcpraw/faketcp"
@@ -20,7 +21,7 @@ var (
 func main() {
 	flag.Parse()
 	if addr == nil || *addr == "" {
-		fmt.Printf("addr unset, eg ./%s -l 0.0.0.0:9191 \n", os.Args[0])
+		fmt.Printf("addr unset, eg ./%s -l x.x.x.x:9191,y.y.y.y:9191 \n", os.Args[0])
 		return
 	}
 	if batchSize != nil && *batchSize > 0 {
@@ -32,7 +33,11 @@ func main() {
 	// if err := l.Listen(*addr); err != nil {
 	// 	panic(err)
 	// }
-	l, err := faketcp.FakeTcpListen(ctx, *addr)
+	// 侦听单个地址
+	//l, err := faketcp.FakeTcpListen(ctx, *addr)
+
+	//可以单个或多个多个地址
+	l, err := faketcp.FakeTcpListeners(ctx, strings.Split(*addr, ",")...)
 	if err != nil {
 		panic(err)
 	}

@@ -172,7 +172,7 @@ func NewFakeTcpListener(ctx context.Context) *Listener {
 		ctx:      ctx,
 		cancel:   cancel,
 		connMap:  make(map[string]*FakeConn, 128),
-		connChan: make(chan *FakeConn, 2048),
+		connChan: make(chan *FakeConn, 1024),
 		delayMap: make(map[*FakeConn]time.Time, 128),
 	}
 }

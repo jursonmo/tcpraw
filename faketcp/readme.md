@@ -38,3 +38,4 @@
 
 9. log: 增加日志，方便调试.
 10. FakeConn 关联 flow, 这样flow 超时删除时，可以通知FakeConn 执行关闭操作。或者FakeConn关闭时，可以让flow 进入到timewait的状态，这个状态下即使收到数据，也不会往上层push送数据（flow 的作用类似于内核的socket维护）。
+11. server 侦听0.0.0.0，会给每个本地每个ip 都创建一个handle来抓包，这样实在是太多了，目前tcp.raw.Listen()只能侦听单个ip. (DONE: Listeners对象是对Listener 的封装，实现侦听多个地址, 兼容单个地址的侦听. 接口FakeTcpListeners(ctx, addrs...).)。
