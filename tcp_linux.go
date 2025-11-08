@@ -541,11 +541,12 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			} else {
 				n, err = e.handle.WriteToIP(e.buf.Bytes(), &net.IPAddr{IP: raddr.IP})
 			}
-			if n != len(e.buf.Bytes()) {
-				panic(fmt.Sprintf("tcpraw write len != payload len, write len:%d, payload len:%d", n, len(p)))
-			}
 			if err != nil {
 				return
+			}
+			//理论上，如果发送成功，n 应该等于 e.buf.Bytes() 的长度。不会出现只写了部分数据。
+			if n != len(e.buf.Bytes()) {
+				panic(fmt.Sprintf("tcpraw write len != payload len, write len:%d, payload len:%d", n, len(p)))
 			}
 
 			// increase seq in flow
