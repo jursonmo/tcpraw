@@ -498,7 +498,8 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 				return
 			}
 			e.Lock()
-			defer e.Unlock()
+			defer e.Unlock() //下面的Write发送操作是阻塞式的,这可能会影响接受此流数据时由于锁竞争而阻塞。 TODO: 多个任务同时发送同一个流数据, 会有问题吗？有,同时操作e.buf
+
 			// if the flow doesn't have handle , assume this packet has lost, without notification
 			if e.handle == nil { //mo: 经过captureFlow 捕获过的flow 都有handle, 没有handle的flow说明是本端主动发送一个全新的包， 理论上不应该发送， 应该返回错误。
 				//n = len(p) //mo: 这里不返回n = len(p)，而是返回 n=0， 这样上层应用可以根据返回的n=0，来判断是否重新发送数据。
@@ -536,6 +537,7 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 			e.buf.Clear()
 			gopacket.SerializeLayers(e.buf, conn.opts, &e.tcpHeader, gopacket.Payload(p))
+			//e.Unlock() //在发送前解锁。这样就不能保证多个任务同时Write的问题。
 			if conn.tcpconn != nil {
 				n, err = e.handle.Write(e.buf.Bytes()) //mo: 说明是client端，发送数据到对方, client dialIp 是指定了目的ip, 所以发送数据是直接发送给对方。
 			} else {
@@ -548,10 +550,13 @@ func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			if n != len(e.buf.Bytes()) {
 				panic(fmt.Sprintf("tcpraw write len != payload len, write len:%d, payload len:%d", n, len(p)))
 			}
-
+			//e.Lock()
 			// increase seq in flow
 			e.seq += uint32(len(p))
+			//mo: 就算当前发送的这个报文丢失了,也没关系, 收到对方的ack, 就会无条件更新成对方的ack, 这样这里seq 又回到之前的值， 即对方告诉你重新用这个seq 发送数据，
+			// 这个跟tcp 的重传机制不一样, tcp 的重传机制是，如果收到对方的ack 跟本地的seq 不相等,会认为丢包，会重传之前的报文，而这里不会， 这里会用对方ack 重置本地的seq, 并用这个新seq 发送新的报文。
 			n = len(p)
+			//e.Unlock()
 		})
 	}
 	return
