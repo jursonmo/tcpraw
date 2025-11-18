@@ -15,6 +15,8 @@ import (
 
 type FakeConn struct {
 	sync.Mutex
+	readLock sync.Mutex
+
 	ctx      context.Context
 	cancel   context.CancelFunc
 	listener *Listener
@@ -30,11 +32,13 @@ type FakeConn struct {
 	rxBytes     uint64
 	dropRxBytes uint64
 
+	fec *Fec
+
 	closed bool
 }
 
 func (f *FakeConn) String() string {
-	return fmt.Sprintf("fakeconn: %s, laddr: %s, addr: %s, txBytes: %d, rxBytes: %d, dropRxBytes: %d", f.fakeConn.LocalAddr().String(), f.laddr.String(), f.addr.String(), f.txBytes, f.rxBytes, f.dropRxBytes)
+	return fmt.Sprintf("fakeconn: %s, laddr: %s, addr: %s, txBytes: %d, rxBytes: %d, dropRxBytes: %d, fec:%d-%d", f.fakeConn.LocalAddr().String(), f.laddr.String(), f.addr.String(), f.txBytes, f.rxBytes, f.dropRxBytes, f.listener.fecDataShards, f.listener.fecParityShards)
 }
 
 func (f *FakeConn) GetTxBytes() uint64 {
@@ -49,10 +53,13 @@ func (f *FakeConn) GetDropRxBytes() uint64 {
 	return f.dropRxBytes
 }
 
+var fecTest bool = false
+var test_num int = 0
+
 // 业务层ReadFull, 不一定一次读取完, 先返回recvLeft, 再从recvch 中读取数据
 func (f *FakeConn) Read(b []byte) (int, error) {
-	f.Lock()
-	defer f.Unlock()
+	f.readLock.Lock()
+	defer f.readLock.Unlock()
 	// 先返回recvLeft
 	if len(f.recvLeft) > 0 {
 		n := copy(b, f.recvLeft)
@@ -61,18 +68,49 @@ func (f *FakeConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	select {
-	case data := <-f.recvch:
-		n := copy(b, data)
-		// 剩余数据保存到recvLeft
-		if n < len(data) {
-			f.recvLeft = data[n:]
+	var data []byte
+	if f.fec != nil {
+		var err error
+		data, err = f.fec.DecodeData(func() ([]byte, error) {
+			for {
+				data, ok := <-f.recvch
+				if !ok {
+					return nil, fmt.Errorf("%v, recvch closed", f)
+				}
+				if len(data) == 0 {
+					continue
+				}
+
+				if fecTest {
+					test_num++
+					log.Printf("recv data len: %d, test_num: %d", len(data), test_num)
+					//在不丢包的环境里模拟丢包, 测试配置项 dataShards 10, parityShards 2, 所以每12个包， 模拟丢包一次 或者 模拟丢包2次
+					if test_num%12 == 5 || test_num%12 == 6 {
+						log.Printf("simulate drop packet for fec test recover, test_num: %d", test_num)
+						continue //模拟丢包
+					}
+				}
+				return data, nil
+			}
+		})
+		if err != nil {
+			return 0, err
 		}
-		f.rxBytes += uint64(n)
-		return n, nil
-	case <-f.ctx.Done():
-		return 0, errors.New("context done")
+	} else {
+		var ok bool
+		data, ok = <-f.recvch
+		if !ok {
+			return 0, errors.New("recvch closed")
+		}
 	}
+
+	n := copy(b, data)
+	// 剩余数据保存到recvLeft
+	if n < len(data) {
+		f.recvLeft = data[n:]
+	}
+	f.rxBytes += uint64(n)
+	return n, nil
 }
 
 func (f *FakeConn) Push(b []byte) {
@@ -89,6 +127,21 @@ func (f *FakeConn) Write(b []byte) (int, error) {
 }
 
 func (f *FakeConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if f.fec != nil {
+		err := f.fec.EncodeData(b, func(p []byte) error {
+			n, err := f.fakeConn.WriteTo(p, addr)
+			if err != nil {
+				return err
+			}
+			atomic.AddUint64(&f.txBytes, uint64(n))
+			return nil
+		})
+		if err != nil {
+			return 0, err
+		}
+		return len(b), nil
+	}
+
 	n, err := f.fakeConn.WriteTo(b, addr)
 	if err != nil {
 		return 0, err
@@ -110,7 +163,7 @@ func (f *FakeConn) close(immediately bool) error {
 	f.closed = true
 
 	//必须要从listener 的connMap 中删除，否则后面收到相同地址的报文，就不会再创建fakeconn，即Accept 不会返回该fakeconn。
-	//但是为了避免这个流还有残留的数据,导致错误认为新的连接，是不是需要延迟删除？
+	//但是为了避免这个流还有残留的数据,导致错误认为新的连接，是不是需要延迟删除？TODO: 最好关联底层flow 来删除。
 	if immediately {
 		f.listener.deleteFakeConn(f)
 	} else {
@@ -155,11 +208,31 @@ type Listener struct {
 	delayMap map[*FakeConn]time.Time
 
 	connChan chan *FakeConn
+
+	fecEnable       bool
+	fecDataShards   int
+	fecParityShards int
+}
+
+type ListenerOption func(*Listener)
+
+func WithListenerFec(dataShards, parityShards int) ListenerOption {
+	return func(l *Listener) {
+		if dataShards <= 0 || parityShards <= 0 {
+			panic("fec data shards or parity shards must be greater than 0")
+		}
+		l.fecEnable = true
+		l.fecDataShards = dataShards
+		l.fecParityShards = parityShards
+	}
 }
 
 // FakeTcpListen 其实是合并 l :=NewFakeTcpListener 和 l.Listen(), 更加方便使用。
-func FakeTcpListen(ctx context.Context, addr string) (*Listener, error) {
+func FakeTcpListen(ctx context.Context, addr string, opts ...ListenerOption) (*Listener, error) {
 	l := NewFakeTcpListener(ctx)
+	for _, opt := range opts {
+		opt(l)
+	}
 	if err := l.Listen(addr); err != nil {
 		return nil, err
 	}
@@ -308,6 +381,24 @@ func (l *Listener) FatchOneFakeConn() (*FakeConn, error) {
 	return nil, errors.New("no fake conn found")
 }
 
+func (l *Listener) newFakeConn(addr net.Addr) *FakeConn {
+	ctx, cancel := context.WithCancel(l.ctx)
+	fc := &FakeConn{
+		ctx:      ctx,
+		cancel:   cancel,
+		listener: l,
+		laddr:    l.laddr,
+		addr:     addr,
+		fakeConn: l.fakeConn,
+		recvch:   make(chan []byte, 2048), //put操作是非阻塞, 队列满马上丢弃, 所以这里设置大一点，避免队列满而drop数据。
+		sendch:   make(chan []byte, 1024),
+	}
+	if l.fecEnable {
+		fc.fec = NewFec(l.fecDataShards, l.fecParityShards, 0)
+	}
+	return fc
+}
+
 func (l *Listener) acceptDataLoop() {
 	defer l.Close() //mo: last defer, 最后执行关闭listener。
 	defer l.wg.Done()
@@ -332,20 +423,9 @@ func (l *Listener) acceptDataLoop() {
 			continue
 		}
 		l.mu.RUnlock()
-		ctx, cancel := context.WithCancel(l.ctx)
-		fc := &FakeConn{
-			ctx:      ctx,
-			cancel:   cancel,
-			listener: l,
-			laddr:    l.laddr,
-			addr:     addr,
-			fakeConn: l.fakeConn,
-			recvch:   make(chan []byte, 2048), //put操作是非阻塞, 队列满马上丢弃,所以这里设置大一点，避免队列满而drop数据。
-			sendch:   make(chan []byte, 1024),
-		}
-		// go fc.readLoop()
-		// go fc.writeLoop()
-		log.Println("new connection from:", addr.String(), "local addr:", l.laddr.String())
+
+		fc := l.newFakeConn(addr)
+		log.Printf("new connection from:%s local addr:%s, fec:%d-%d", addr.String(), l.laddr.String(), l.fecDataShards, l.fecParityShards)
 
 		//非阻塞。
 		select {

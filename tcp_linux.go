@@ -408,7 +408,7 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 		e.handle = handle
 	})
 
-	// 如果此流不是孤立的，并收到PSH（说明有数据负载），则把数据推送出去
+	//mo: 如果此流不是孤立的，并收到PSH（说明有数据负载），则把数据推送出去, 三次握手的tcp数据不会包含在PSH, 不会推送到上层
 	if !orphan && tcp.PSH {
 		// 拷贝TCP负载内容到新的切片
 		payload := make([]byte, len(tcp.Payload))
@@ -741,7 +741,7 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
-	//mo: check handle 和 tcpconn 绑定的本地地址是否相同
+	//add by mo: check handle 和 tcpconn 绑定的本地地址是否相同
 	if handle.LocalAddr().String() != laddr {
 		panic(fmt.Sprintf("handle and tcpconn bound local address are not the same: handle: %v, tcpconn: %v", handle.LocalAddr(), laddr))
 	}

@@ -20,7 +20,7 @@ type Listeners struct {
 	connChan  chan net.Conn
 }
 
-func FakeTcpListeners(ctx context.Context, addrs ...string) (*Listeners, error) {
+func FakeTcpListeners(ctx context.Context, addrs []string, opts ...ListenerOption) (*Listeners, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	listeners := &Listeners{
 		ctx:       ctx,
@@ -31,7 +31,7 @@ func FakeTcpListeners(ctx context.Context, addrs ...string) (*Listeners, error) 
 	}
 
 	for _, addr := range addrs {
-		listener, err := FakeTcpListen(listeners.ctx, addr)
+		listener, err := FakeTcpListen(listeners.ctx, addr, opts...)
 		if err != nil {
 			return nil, err
 		}

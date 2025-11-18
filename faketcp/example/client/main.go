@@ -17,6 +17,9 @@ var (
 	addr      = flag.String("addr", "", "server address")
 	count     = flag.Int("c", 3, "send count")
 	batchSize = flag.Int("b", 0, "batch size")
+
+	fecDataShards   = flag.Int("d", 10, "fec data shards")
+	fecParityShards = flag.Int("p", 2, "fec parity shards")
 )
 
 func main() {
@@ -29,8 +32,16 @@ func main() {
 		tcpraw.BatchSize = *batchSize
 	}
 
+	opts := []faketcp.ClientOption{}
+	if fecDataShards != nil && *fecDataShards > 0 && fecParityShards != nil && *fecParityShards > 0 {
+		log.Printf("fec enabled, data shards: %d, parity shards: %d", *fecDataShards, *fecParityShards)
+		if fecDataShards != nil && *fecDataShards > 0 && fecParityShards != nil && *fecParityShards > 0 {
+			opts = append(opts, faketcp.WithClientFec(*fecDataShards, *fecParityShards))
+		}
+	}
+
 	ctx := context.Background()
-	conn, err := faketcp.Dial(ctx, *addr)
+	conn, err := faketcp.Dial(ctx, *addr, opts...)
 	if err != nil {
 		panic(err)
 	}

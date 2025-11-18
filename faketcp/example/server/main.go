@@ -16,6 +16,10 @@ import (
 var (
 	addr      = flag.String("l", "", "listen address")
 	batchSize = flag.Int("b", 0, "batch size")
+
+	// fec options
+	fecDataShards   = flag.Int("d", 10, "fec data shards")
+	fecParityShards = flag.Int("p", 2, "fec parity shards")
 )
 
 func main() {
@@ -28,6 +32,14 @@ func main() {
 		tcpraw.BatchSize = *batchSize
 	}
 
+	opts := []faketcp.ListenerOption{}
+	if fecDataShards != nil && *fecDataShards > 0 && fecParityShards != nil && *fecParityShards > 0 {
+		log.Printf("fec enabled, data shards: %d, parity shards: %d", *fecDataShards, *fecParityShards)
+		if fecDataShards != nil && *fecDataShards > 0 && fecParityShards != nil && *fecParityShards > 0 {
+			opts = append(opts, faketcp.WithListenerFec(*fecDataShards, *fecParityShards))
+		}
+	}
+
 	ctx := context.Background()
 	// l := faketcp.NewFakeTcpListener(ctx)
 	// if err := l.Listen(*addr); err != nil {
@@ -37,7 +49,7 @@ func main() {
 	//l, err := faketcp.FakeTcpListen(ctx, *addr)
 
 	//可以单个或多个多个地址
-	l, err := faketcp.FakeTcpListeners(ctx, strings.Split(*addr, ",")...)
+	l, err := faketcp.FakeTcpListeners(ctx, strings.Split(*addr, ","), opts...)
 	if err != nil {
 		panic(err)
 	}
