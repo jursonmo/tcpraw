@@ -327,7 +327,8 @@ func (l *Listener) Listen(address string) error {
 
 	l.fakeConn = conn
 	l.wg.Add(1)
-	go l.acceptDataLoop()
+	//go l.acceptDataLoop()
+	go l.acceptDataLoopv2()
 	l.wg.Add(1)
 	go l.cleaner()
 	return nil
@@ -437,6 +438,47 @@ func (l *Listener) acceptDataLoop() {
 			data := make([]byte, n)
 			copy(data, buf[:n])
 			//log.Println("listener push bytes:", n, "data:", string(data))
+			fc.Push(data)
+		default:
+			log.Println("listener connChan is full, drop connection from:", addr.String())
+		}
+	}
+}
+
+// acceptDataLoopv2 是 acceptDataLoop 的升级版本, 少了两次复制数据的操作。
+// 1. 直接从 fakeConn ReadFromv2 直接获取数据，而不是从 buf 复制数据。
+// 2. 直接调用 fc.Push(data) 而不是复制数据到 data 后调用 fc.Push(data)。
+func (l *Listener) acceptDataLoopv2() {
+	defer l.Close() //mo: last defer, 最后执行关闭listener。
+	defer l.wg.Done()
+
+	for {
+		data, addr, err := l.fakeConn.ReadFromv2()
+		if err != nil {
+			panic(fmt.Sprintf("listener readFrom error: %v", err))
+			return
+		}
+		//log.Printf("listener received bytes: %d, addr: %s", n, addr.String())
+		// conn.ReadFrom 时，得到的流已经是绑定指定的handle,且一定是能关联的真实的tcpconn.
+		// 这里根据addr 创建FakeConn 在发送数据时，tcpraw 可以使用handle.LocalAddr() 作为本地地址, 也可以使用tcpraw flow 绑定的真实的tcpconn的源地址。
+		//先判断connMap是否存在
+		l.mu.RLock()
+		if fc, ok := l.connMap[common.AddrToKey(addr)]; ok {
+			l.mu.RUnlock()
+			fc.Push(data) //非阻塞。避免影响后面其他流的数据的读取。
+			continue
+		}
+		l.mu.RUnlock()
+
+		fc := l.newFakeConn(addr)
+		log.Printf("new connection from:%s local addr:%s, fec:%d-%d", addr.String(), l.laddr.String(), l.fecDataShards, l.fecParityShards)
+
+		//非阻塞。
+		select {
+		case l.connChan <- fc:
+			l.mu.Lock()
+			l.connMap[common.AddrToKey(addr)] = fc
+			l.mu.Unlock()
 			fc.Push(data)
 		default:
 			log.Println("listener connChan is full, drop connection from:", addr.String())

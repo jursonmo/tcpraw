@@ -462,6 +462,26 @@ func (conn *tcpConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	}
 }
 
+// 相比ReadFrom, ReadFromv2优点是少一次copy, 直接返回数据切片，缺点是没有实现接口 PacketConn ReadFrom method.
+func (conn *tcpConn) ReadFromv2() ([]byte, net.Addr, error) {
+	var timer *time.Timer
+	var deadline <-chan time.Time
+	if d, ok := conn.readDeadline.Load().(time.Time); ok && !d.IsZero() {
+		timer = time.NewTimer(time.Until(d))
+		defer timer.Stop()
+		deadline = timer.C
+	}
+
+	select {
+	case <-deadline:
+		return nil, nil, errTimeout
+	case <-conn.die:
+		return nil, nil, io.EOF
+	case packet := <-conn.chMessage:
+		return packet.bts, packet.addr, nil
+	}
+}
+
 // WriteTo implements the PacketConn WriteTo method.
 func (conn *tcpConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	var deadline <-chan time.Time
