@@ -325,6 +325,8 @@ func getIPv4HeaderLen(b []byte) int {
 	return l
 }
 
+var redcolor = "\033[31m"  // 红色代码
+var resetcolor = "\033[0m" // 重置颜色代码
 func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.IPConn, targetPort int, opt gopacket.DecodeOptions) (err error) {
 	n := len(buf)
 	// 尝试把收到的buf[:n]数据解析为TCP包
@@ -413,13 +415,15 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 		// 拷贝TCP负载内容到新的切片
 		payload := make([]byte, len(tcp.Payload))
 		if len(tcp.Payload) > 10000 { //分片重组后, 可能会超过10000字节
-			log.Printf("tcp payload len > 10000, len:%d", len(tcp.Payload))
+			log.Printf("%s tcp payload len > 10000, len:%d %s", redcolor, len(tcp.Payload), resetcolor)
 		}
 		//test, 限制tcp payload 不能超过或等于MaxPayloadSize, 这样说明有截断, 这里先panic
 		if len(tcp.Payload) >= MaxPayloadSize {
 			panic("tcp payload len > MaxPayloadSize")
 		}
-		copy(payload, tcp.Payload)
+		if n := copy(payload, tcp.Payload); n != len(tcp.Payload) {
+			panic(fmt.Sprintf("%s tcp payload copy len not equal, copy:%d, len:%d %s", redcolor, n, len(tcp.Payload), resetcolor))
+		}
 		_ = shardIndex
 		//log.Println("captureFlow, shardIndex:", shardIndex, "push bytes:", len(payload), "data:", string(payload))
 		// 通过通道chMessage把数据发送出来，或监听到conn.die关闭返回
