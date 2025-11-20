@@ -835,6 +835,20 @@ func Dial(network, address string) (*TCPConn, error) {
 			}
 		}
 	}
+	//add by mo: tcp真实socket可能会长时间(测试看是150秒左右)无法正常工作而被关闭, 如果依然收到数据，本地会回应很多reset报文,导致性能下降
+	//但是tcp socket 内核自动发送的reset 包, ttl 不是1, 而是64. 也就是上面的ttl=1的规则无法drop掉这些reset 包。需要手动添加一条规则, 丢弃所有本地发出的reset包。
+	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
+		rule := []string{"-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "--tcp-flags", "ALL", "RST", "-j", "DROP"}
+		exists, err := ipt.Exists("filter", "OUTPUT", rule...)
+		if err != nil {
+			panic(err)
+		}
+		if !exists {
+			if err = ipt.Append("filter", "OUTPUT", rule...); err != nil {
+				panic(fmt.Sprintf("set iptables rule failed: %v", err))
+			}
+		}
+	}
 	// 设置 IPv6 iptables 规则
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
 		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-s", laddr, "--sport", lport, "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
@@ -960,6 +974,21 @@ func Listen(network, address string) (*TCPConn, error) {
 			}
 		}
 	}
+	//add by mo: drop reset, use iptables -nvL OUTPUT to check
+	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
+		rule := []string{"-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "--tcp-flags", "ALL", "RST", "-j", "DROP"}
+		exists, err := ipt.Exists("filter", "OUTPUT", rule...)
+		if err != nil {
+			panic(err)
+		}
+
+		if !exists {
+			if err = ipt.Append("filter", "OUTPUT", rule...); err != nil {
+				panic(fmt.Sprintf("set iptables rule failed: %v", err))
+			}
+		}
+	}
+
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
 		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
 		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
