@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jursonmo/tcpraw"
+	"github.com/jursonmo/tcpraw/common"
 )
 
 type FakeConn struct {
@@ -204,7 +205,7 @@ type Listener struct {
 	fakeConn *tcpraw.TCPConn
 	laddr    *net.TCPAddr
 	mu       sync.RWMutex
-	connMap  map[string]*FakeConn
+	connMap  map[common.AddrKey]*FakeConn
 	delayMap map[*FakeConn]time.Time
 
 	connChan chan *FakeConn
@@ -244,7 +245,7 @@ func NewFakeTcpListener(ctx context.Context) *Listener {
 	return &Listener{
 		ctx:      ctx,
 		cancel:   cancel,
-		connMap:  make(map[string]*FakeConn, 128),
+		connMap:  make(map[common.AddrKey]*FakeConn, 128),
 		connChan: make(chan *FakeConn, 1024),
 		delayMap: make(map[*FakeConn]time.Time, 128),
 	}
@@ -414,7 +415,7 @@ func (l *Listener) acceptDataLoop() {
 		// 这里根据addr 创建FakeConn 在发送数据时，tcpraw 可以使用handle.LocalAddr() 作为本地地址, 也可以使用tcpraw flow 绑定的真实的tcpconn的源地址。
 		//先判断connMap是否存在
 		l.mu.RLock()
-		if fc, ok := l.connMap[addr.String()]; ok {
+		if fc, ok := l.connMap[common.AddrToKey(addr)]; ok {
 			l.mu.RUnlock()
 			data := make([]byte, n)
 			copy(data, buf[:n])
@@ -431,7 +432,7 @@ func (l *Listener) acceptDataLoop() {
 		select {
 		case l.connChan <- fc:
 			l.mu.Lock()
-			l.connMap[addr.String()] = fc
+			l.connMap[common.AddrToKey(addr)] = fc
 			l.mu.Unlock()
 			data := make([]byte, n)
 			copy(data, buf[:n])
@@ -445,7 +446,7 @@ func (l *Listener) acceptDataLoop() {
 
 func (l *Listener) deleteFakeConn(fc *FakeConn) {
 	l.mu.Lock()
-	delete(l.connMap, fc.addr.String())
+	delete(l.connMap, common.AddrToKey(fc.addr))
 	l.mu.Unlock()
 
 	//TODO: 删除fakeconn 对应的flow表项, 现在可以让对应的flow过期自动删除
@@ -467,7 +468,7 @@ func (l *Listener) cleaner() {
 			l.mu.Lock()
 			for fc, t := range l.delayMap {
 				if time.Now().After(t) {
-					delete(l.connMap, fc.addr.String())
+					delete(l.connMap, common.AddrToKey(fc.addr))
 					delete(l.delayMap, fc)
 				}
 			}
