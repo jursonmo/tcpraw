@@ -303,7 +303,10 @@ func (conn *tcpConn) captureFlow(pc *ipv4.PacketConn, handleId int, handle *net.
 				_ = i
 				buf := msg.Buffers[0]
 				addr := msg.Addr.(*net.IPAddr)
-				iphlen := getIPv4HeaderLen(buf)
+				iphlen := getIPv4HeaderLen(buf) //handle.ReadFromIP(buf) 就是这样计算出ipv4 header len的，然后去掉ip头部的。
+				if iphlen == 0 {                //no ipv4 packet
+					continue
+				}
 				//fmt.Printf("batch:%d read from ip:%s, len:%d, ipv4 header len:%d\n", i, addr.String(), msg.N, iphlen)
 				conn.decodeTCPPacket(buf[iphlen:msg.N], addr, handle, port, opt)
 			}
