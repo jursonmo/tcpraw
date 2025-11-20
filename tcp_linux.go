@@ -431,6 +431,8 @@ func (conn *tcpConn) decodeTCPPacket(buf []byte, addr *net.IPAddr, handle *net.I
 		case conn.chMessage <- message{payload, &src}: //mo: 不是孤立才将数据发送出来，供上层应用读取, 也就是上层读取到的数据一定不是孤立的()
 		case <-conn.die:
 			return
+		default:
+			log.Printf("%s captureFlow drop, shardIndex:%d, PSH packet local: %v:%d, remote: %v, seq:%d ack:%d payload len:%d \n%s", redcolor, shardIndex, handle.LocalAddr().String(), tcp.DstPort, src.String(), tcp.Seq, tcp.Ack, len(tcp.Payload), resetcolor)
 		}
 	}
 	return
@@ -755,7 +757,7 @@ func Dial(network, address string) (*TCPConn, error) {
 	conn.die = make(chan struct{})
 	conn.initFlowTable(1)
 	conn.tcpconn = tcpconn
-	conn.chMessage = make(chan message)
+	conn.chMessage = make(chan message, 2048)
 	ip, port := addrSplit(tcpconn.RemoteAddr())
 	key := addrKey{
 		dip:   ip,
@@ -840,7 +842,7 @@ func Listen(network, address string) (*TCPConn, error) {
 	conn := new(tcpConn)
 	conn.initFlowTable(8)
 	conn.die = make(chan struct{})
-	conn.chMessage = make(chan message)
+	conn.chMessage = make(chan message, 2048)
 	conn.opts = gopacket.SerializeOptions{
 		FixLengths:       true,
 		ComputeChecksums: true,
