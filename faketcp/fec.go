@@ -123,9 +123,11 @@ func (fec *Fec) Encode(data []byte) [][]byte {
 /*
      FecHeaderSize      | 2B data size
       4           1   1    2 (Byte)
-+---+---+---+---+---+---+---+---+
-|     seqid     |  flag |  len  |
-+---+---+---+---+---+---+---+---+
++---+---+---+---+---+---+---+---+---------------+
+|     seqid     |  flag |  plen |  user payloay |
++---+---+---+---+---+---+---+---+---------------+
+|	fec header			|---fec de/endcode buf--|
+
 */
 
 const (
