@@ -524,7 +524,7 @@ func (l *Listener) cleaner() {
 				}
 			}
 			l.mu.RUnlock()
-
+			log.Printf("faketcp listener cleaner expire fake conns:%v\n", deleteFcs)
 			for _, fc := range deleteFcs {
 				fc.close(true)
 			}
