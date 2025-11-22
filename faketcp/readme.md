@@ -25,7 +25,6 @@
 3. bug: 
     + 3.1 对于服务端而已, 只以对端的信息作为flow 的key, 不需要本地ip和端口吗? 那么如果服务端侦听多个本地地址， 对方用同一个地址来连接，冲突怎么处理? conn.flowtable 是包含了所有handle 生成的flow表项的， 是有可能冲突的。(不好处理，因为发送数据时，只知道目的地址，不知道源地址，除非每个流生成一个对应的自定义myconn 对象，源地址记录在myconn里，然后由myconn来收发数据)
     + 3.2 cleaner这个协程没有用for来保证重复执行, 只执行一次就退出循环了。(DONE)
-    + 3.3 流量测试: 结合mvnet 测试， 140秒左右就开始出现下降，原因是程序运行150秒左右后，发送很多tcp reset 报文，导致双方性能下降。解决方法iptables drop reset 报文。(DONE)
 
 4. client 每次dial拨号都生成一个明显的iptables规则，这样容易累计过多的iptables规则，可以像listener那样，添加一个禁止所有ttl=1 的tcp 报文iptables规则即可。(DONE)
 5. 如果对方是真实的tcp, 本地端是tcpraw能，即对端正常根据seq ack 来处理重传的，这会不会有异常。
@@ -38,6 +37,8 @@
    + 8.4 实现批量写。
    + 8.5 给listener 可以增加REUSEADDR特性, 这样可以使多个listener侦听一个本地地址，其到负载作用吗？答:经过验证，原始套接字，使用 SO_REUSEPORT 并不能实现真正的负载均衡，多个原始套接字会收到相同的数据包副本。 为什么不能负载均衡 1. 数据包复制：内核将每个匹配的数据包复制到所有绑定的原始套接字 2.无分发逻辑：原始套接字没有像 TCP/UDP 那样的连接或流的概念
    + 8.6 跑流量测试时，发现mvnet server 端GC次数很多，两秒内就有6-7次gc.acceptDataLoopv2()copy次数从而减少了GC次数, 减少一半GC次数。(DONE)
+   + 8.7 流量测试: 结合mvnet 测试， 140秒左右就开始出现下降，原因是程序运行150秒左右后，发送很多tcp reset 报文，导致双方性能下降。解决方法iptables drop reset 报文。(DONE)
+   + 8.8 TODO: 虽然iptables drop reset 报文, 最好的方式是不要产生reset报文, 比如接受到数据后，不要让真实的tcp socket知道，需要在原始socket接受后，正常tcp socket接受前drop 报文。
 
 9. log: 增加日志，方便调试.
 10. FakeConn 关联 flow, 这样flow 超时删除时，可以通知FakeConn 执行关闭操作。或者FakeConn关闭时，可以让flow 进入到timewait的状态，这个状态下即使收到数据，也不会往上层push送数据（flow 的作用类似于内核的socket维护）。
