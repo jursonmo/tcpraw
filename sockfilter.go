@@ -1,7 +1,10 @@
 package tcpraw
 
 import (
+	"fmt"
 	"net"
+	"syscall"
+	"unsafe"
 
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
@@ -157,3 +160,73 @@ k: 参数或偏移量
 
 
 */
+
+type sockFilter struct {
+	code uint16
+	jt   uint8
+	jf   uint8
+	k    uint32
+}
+
+type sockFprog struct {
+	len    uint16
+	filter *sockFilter
+}
+
+// 可以使用attachBPFFilter BPF 过滤tcp 报文，因为socket接受到数据，所以可以防止本地回应ttl=1的ack报文：
+/*
+iptables -nvL OUTPUT
+Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+   10   520 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            TTL match TTL == 1 tcp spt:12348
+ 540K   22M DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp spt:12348 flags:0x3F/0x04
+*/
+func attachBPFFilter(conn net.Conn) error {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return fmt.Errorf("not a TCP connection")
+	}
+
+	// file, err := tcpConn.File()
+	// if err != nil {
+	// 	return err
+	// }
+	// defer file.Close()
+
+	// fd := int(file.Fd())
+
+	rawConn, err := tcpConn.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	// BPF程序：无条件丢弃所有数据包
+	filter := []sockFilter{
+		{code: 0x06, jt: 0, jf: 0, k: 0}, // BPF_RET | BPF_K, 0
+	}
+
+	prog := sockFprog{
+		len:    uint16(len(filter)),
+		filter: &filter[0],
+	}
+
+	err = rawConn.Control(func(fd uintptr) {
+		// 设置SO_ATTACH_FILTER选项
+		_, _, errno := syscall.Syscall6(
+			syscall.SYS_SETSOCKOPT,
+			uintptr(fd),
+			uintptr(syscall.SOL_SOCKET),
+			uintptr(syscall.SO_ATTACH_FILTER),
+			uintptr(unsafe.Pointer(&prog)),
+			uintptr(unsafe.Sizeof(prog)),
+			0,
+		)
+		if errno != 0 {
+			panic(fmt.Sprintf("setsockopt failed: %v", errno))
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}

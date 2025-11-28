@@ -37,8 +37,41 @@
    + 8.4 实现批量写。
    + 8.5 给listener 可以增加REUSEADDR特性, 这样可以使多个listener侦听一个本地地址，其到负载作用吗？答:经过验证，原始套接字，使用 SO_REUSEPORT 并不能实现真正的负载均衡，多个原始套接字会收到相同的数据包副本。 为什么不能负载均衡 1. 数据包复制：内核将每个匹配的数据包复制到所有绑定的原始套接字 2.无分发逻辑：原始套接字没有像 TCP/UDP 那样的连接或流的概念
    + 8.6 跑流量测试时，发现mvnet server 端GC次数很多，两秒内就有6-7次gc.acceptDataLoopv2()copy次数从而减少了GC次数, 减少一半GC次数。(DONE)
-   + 8.7 流量测试: 结合mvnet 测试， 140秒左右就开始出现下降，原因是程序运行150秒左右后，发送很多tcp reset 报文，导致双方性能下降。解决方法iptables drop reset 报文。(DONE)
-   + 8.8 TODO: 虽然iptables drop reset 报文, 最好的方式是不要产生reset报文, 比如接受到数据后，不要让真实的tcp socket知道，需要在原始socket接受后，正常tcp socket接受前drop 报文。
+   + 8.7 流量测试: 结合mvnet 测试， 140秒左右就开始出现下降，原因是程序运行150秒左右后，发送很多tcp reset 报文(本地真实tcpsocket 关闭后，收到tcp数据后，本地就会回应reset报文)，导致双方性能下降。解决方法iptables drop reset 报文。(DONE)
+     ```
+     使用iptables drop reset 报文后，下面可以看到reset 报文被drop了, reset 报文还真的不少。
+    root@ubuntu:~# iptables -nvL OUTPUT
+        Chain OUTPUT (policy ACCEPT 18M packets, 47G bytes)
+        pkts bytes target     prot opt in     out     source               destination
+        1367K   71M DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            TTL match TTL == 1
+        4236K  169M DROP       tcp  --  *      *       0.0.0.0/0            192.168.4.208        tcp dpt:12348 flags:0x3F/0x04
+     ```
+   + 8.8 TODO: 虽然iptables drop reset 报文, 最好的方式是不要产生reset报文, 比如本地接受到数据后，raw socket能收到数据，但是不要让真实的tcp socket知道，需要在原始socket接受后，在正常tcp socket接受前drop 报文。
+   ```
+    如果使用 iptables -I INPUT -p tcp --dport xxx -j DROP 会同时阻断原始套接字和正常TCP套接字接收数据。
+
+    内核数据包处理流程：
+    text
+    netif_receive_skb()
+        → ip_rcv()                    # IP层接收
+        → ip_rcv_finish()
+        → ip_local_deliver()          # 本地投递
+            → ip_local_deliver_finish()
+                → raw_local_deliver() # 原始套接字接收点 ← 会受到影响
+                → tcp_v4_rcv()        # TCP层接收 ← 会受到影响
+    问题在于：Netfilter的 INPUT 链钩子在 ip_local_deliver() 之前执行，DROP动作会完全丢弃数据包，导致后续的 raw_local_deliver() 和 tcp_v4_rcv() 都收不到数据。
+    ```
+    ```
+    //可以使用attachBPFFilter BPF 过滤tcp 报文，因为socket接受到数据，所以可以防止本地回应ttl=1的ack报文. 但是等tcpconn关闭后，本地发送reset报文还是很多。
+    /*
+    iptables -nvL OUTPUT
+        Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)
+        pkts bytes target     prot opt in     out     source               destination
+        10   520 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            TTL match TTL == 1 tcp spt:12348
+        540K   22M DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp spt:12348 flags:0x3F/0x04
+    */
+    ```
+    目前没有办法在tcpconn关闭后阻止本地回应reset 报文，只能通过iptables drop reset 报文。
 
 9. log: 增加日志，方便调试.
 10. FakeConn 关联 flow, 这样flow 超时删除时，可以通知FakeConn 执行关闭操作。或者FakeConn关闭时，可以让flow 进入到timewait的状态，这个状态下即使收到数据，也不会往上层push送数据（flow 的作用类似于内核的socket维护）。

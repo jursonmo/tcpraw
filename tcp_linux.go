@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"runtime"
@@ -862,7 +861,8 @@ func Dial(network, address string) (*TCPConn, error) {
 		}
 	}
 
-	go io.Copy(ioutil.Discard, tcpconn)
+	//go io.Copy(ioutil.Discard, tcpconn) //mo: 不去读数据，避免系统调用。是不是开销少些。
+	attachBPFFilter(tcpconn)
 
 	// 维护全局链表（便于统一管理和 GC）
 	connListMu.Lock()
@@ -989,6 +989,8 @@ func Listen(network, address string) (*TCPConn, error) {
 		}
 	}
 
+	//如何做到对方发过来的数据，本地raw socket 能读到数，但是又不让真实tcp socket 收到数据？
+
 	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
 		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "--sport", fmt.Sprint(laddr.Port), "-j", "DROP"}
 		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
@@ -1023,7 +1025,9 @@ func Listen(network, address string) (*TCPConn, error) {
 			conn.lockflow(key, func(e *tcpFlow, _ int) { e.conn = tcpconn })
 
 			// discard everything
-			go io.Copy(ioutil.Discard, tcpconn)
+			//go io.Copy(ioutil.Discard, tcpconn) //mo: 不去读数据，避免系统调用。是不是开销少些。
+			attachBPFFilter(tcpconn) //socket过滤所有数据，可以避免本端回应的ack包。
+			//go checkConnClosedTime(tcpconn) //test
 		}
 	}()
 
@@ -1033,6 +1037,24 @@ func Listen(network, address string) (*TCPConn, error) {
 	connListMu.Unlock()
 
 	return wrapConn(conn), nil
+}
+
+func checkConnClosedTime(tcpconn *net.TCPConn) bool {
+	sum := 0
+	closeTime := time.Time{}
+	for {
+		buf := make([]byte, 4096)
+		_, err := tcpconn.Read(buf) //当读取到0字节时，err为io.EOF，说明对端关闭了连接，这个时候系统每收到一个数据，就会返回给对端一个RST包.
+		if err != nil {
+			if closeTime.IsZero() {
+				closeTime = time.Now()
+			}
+			log.Printf("read from tcpconn:%v failed: %v, sum: %d, close time: %v", tcpconn.RemoteAddr(), err, sum, closeTime)
+			time.Sleep(time.Second * 2)
+			continue
+		}
+		sum += 1
+	}
 }
 
 // setTTL 在本项目中用于设置底层 socket 的 TTL（Time-To-Live）字段。
