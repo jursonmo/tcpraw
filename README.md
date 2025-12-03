@@ -1,4 +1,11 @@
 # tcpraw
+> 🔀 **Forked from [xtaci/tcpraw](https://github.com/xtaci/tcpraw)** - 简化iptables规则，提高性能，解决bug, 封装成 io.Reader io.Writer 更容易接入越来的业务。
+
+## 📦 Installation
+
+```bash
+go get github.com/jursonmo/tcpraw
+```
 
 [![GoDoc][1]][2] [![Build Status][3]][4] [![Go Report Card][5]][6] [![Coverage Statusd][7]][8] [![MIT licensed][9]][10] 
 
