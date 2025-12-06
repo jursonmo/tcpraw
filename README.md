@@ -9,8 +9,8 @@ go get github.com/jursonmo/tcpraw
 
 [![GoDoc][1]][2] [![Build Status][3]][4] [![Go Report Card][5]][6] [![Coverage Statusd][7]][8] [![MIT licensed][9]][10] 
 
-[1]: https://godoc.org/github.com/xtaci/tcpraw?status.svg
-[2]: https://godoc.org/github.com/xtaci/tcpraw
+[1]: https://godoc.org/github.com/jursonmo/tcpraw?status.svg
+[2]: https://godoc.org/github.com/jursonmo/tcpraw
 [3]: https://img.shields.io/github/created-at/xtaci/tcpraw
 [4]: https://img.shields.io/github/created-at/xtaci/tcpraw
 [5]: https://goreportcard.com/badge/github.com/xtaci/tcpraw
@@ -35,7 +35,7 @@ A packet-oriented connection by simulating TCP protocol
 
 ## Documentation
 
-For complete documentation, see the associated [Godoc](https://godoc.org/github.com/xtaci/tcpraw).
+For complete documentation, see the associated [Godoc](https://godoc.org/github.com/jursonmo/tcpraw).
 
 
 ## Benchmark

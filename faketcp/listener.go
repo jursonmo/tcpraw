@@ -268,7 +268,7 @@ tcp        0      0 192.168.4.208:9191      0.0.0.0:*               LISTEN      
 tcp        0      0 192.168.4.208:9191      192.168.4.202:52220     ESTABLISHED 3132762/./server
 
 但是过一会，只剩下侦听的socket了。
-root@ubuntu2204:/home/obc# netstat -anlp|grep 9191
+root@ubuntu:/home# netstat -anlp|grep 9191
 tcp        0      0 192.168.4.208:9191      0.0.0.0:*               LISTEN      3132762/./server
 也就是ACCEPT 生产的socket 被关闭了。但是不影响业务层收发数据。
 
